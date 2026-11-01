@@ -132,7 +132,13 @@ td input,td select{width:100%;padding:2px 4px;font-size:13px}
 .row-act{display:flex;gap:3px;opacity:.35}
 tr:hover .row-act{opacity:1}
 .row-act button{border:0;background:none;cursor:pointer;border-radius:5px;padding:1px 5px}
-.row-act button:hover{background:var(--line)}
+.row-act button:hover:not(:disabled){background:var(--line)}
+.row-act button:disabled,.g-mv button:disabled{opacity:.3;cursor:default}
+.flash,.flash td{animation:flash 1.4s ease-out}
+@keyframes flash{0%,50%{background:var(--pri-soft)}}
+[data-row]{scroll-margin:50px 0 8px}
+.wl-t{font-size:14px;margin:14px 0 6px}
+.wl-t:first-of-type{margin-top:4px}
 td.late{color:var(--danger);font-weight:600}
 
 /* gantt */
@@ -146,6 +152,11 @@ td.late{color:var(--danger);font-weight:600}
 .g-row .txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;flex:1}
 .g-row .txt:hover{color:var(--pri)}
 .g-row.sel{background:var(--pri-soft)}
+.g-mv{display:none;flex:none;gap:1px}
+.g-row:hover .g-mv,.g-row:focus-within .g-mv{display:inline-flex}
+.g-mv button{border:0;background:none;cursor:pointer;border-radius:4px;padding:0 3px;font-size:10px;color:var(--ink2);line-height:18px}
+.g-mv button:hover:not(:disabled){background:var(--line)}
+@media (hover:none){.g-mv{display:inline-flex}}
 .g-right{flex:none;position:relative}
 .g-rh{position:sticky;top:0;z-index:4;background:var(--card2);height:46px;border-bottom:1px solid var(--line)}
 .g-rh svg,.g-body{display:block}
@@ -163,6 +174,7 @@ td.late{color:var(--danger);font-weight:600}
 .bar.dragging{cursor:grabbing;opacity:.8}
 .bar .tr{fill-opacity:.32}
 .bar .lbl{fill:var(--ink2);font-size:11px;pointer-events:none}
+.bar .lbl.alt{font-style:italic;fill:var(--ink3)}
 .bar .rz{fill:transparent;cursor:ew-resize}
 .bar .lnk{opacity:0;cursor:crosshair;fill:var(--card);stroke:var(--pri);stroke-width:2;transition:opacity .1s}
 .bar:hover .lnk{opacity:1}

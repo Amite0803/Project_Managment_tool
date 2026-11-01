@@ -9,11 +9,12 @@ Seed data: `NSDI_Geoportal_Task_Breakdown_V11_01112026.xlsx`.
 | Tab | What it does |
 |---|---|
 | Executive Summary | Headline, KPIs, stage timeline, main tasks by stage, categories, owners, coming up, needs attention |
-| WBS | Collapsible task tree with click-to-edit cells, filters and search; add sub-tasks and milestones |
-| Gantt | Drag to move or resize, drag to link, FS/SS/FF/SF dependencies with lag, milestones, baseline, critical path, zoom |
+| WBS | Collapsible task tree with click-to-edit cells, filters and search; reorder with ▲▼; add sub-tasks and milestones |
+| Gantt | Drag to move or resize, drag to link, FS/SS/FF/SF dependencies with lag, milestones, baseline, critical path, zoom; reorder with ▲▼; bars labelled with the assigned role |
 | Milestones | Milestone list with countdown, baseline variance and add/complete actions |
 | Board | Kanban by status with drag and drop |
-| Workload | Open tasks per owner, role or participant, by month or quarter |
+| Resources | Teams, roles and people that fill the owner, role and participant dropdowns; add, rename, merge or delete |
+| Workload | Open tasks by owner and by assigned role side by side, or by participant, by month or quarter |
 | Risks & Issues | Risk, issue, action and decision log with scoring |
 | Plan Health | Automatic checks: overdue, conflicts, duplicates, missing owners, past project end |
 | Settings | Project details, holidays, auto-scheduling, baseline, reset, activity log |
@@ -34,6 +35,8 @@ Also included: undo/redo, autosave, Excel import and export, project files, prin
 - Moving a task pushes dependent tasks later when needed. It does not pull them earlier.
 - The workbook has no progress column, so starting progress is estimated from status: Not started 0%, Ongoing 50%, Review and QA 90%, Done 100%.
 - Milestones are seeded from zero-duration tasks and from names containing sign-off, final approval, kickoff or acceptance certificate.
+- Moving a task up or down swaps it with the neighbouring task under the same parent. The two trade WBS codes, including their sub-tasks; links and dates do not change. So codes can differ from the workbook after a move.
+- Gantt labels show the assigned role. Tasks with no role show the task owner in italics.
 - Critical path shows the chain of dependencies driving the finish of the selected task. It is not a full float calculation.
 
 ## Files

@@ -4,8 +4,11 @@ const KEY = 'nsdi-planner-v1', UI_KEY = 'nsdi-planner-ui';
 const STATUSES = ['Not started', 'Ongoing', 'Review and QA', 'On hold', 'Done'];
 const ST_META = { 'Not started': ['○', '--st-ns', 0], 'Ongoing': ['◔', '--st-on', 50], 'Review and QA': ['◑', '--st-qa', 90], 'On hold': ['⏸', '--st-hd', null], 'Done': ['✓', '--st-dn', 100] };
 const DEP_TYPES = ['FS', 'SS', 'FF', 'SF'];
+const RES_TYPES = ['Team', 'Role', 'Person'];
+const RES_FIELDS = ['owner', 'role', 'other'];
+const NEW_RES = '__new';
 const DEP_LABEL = { FS: 'Finish → Start', SS: 'Start → Start', FF: 'Finish → Finish', SF: 'Start → Finish' };
-const TABS = [['summary', '📊', 'Executive Summary'], ['wbs', '🗂️', 'WBS'], ['gantt', '📅', 'Gantt'], ['milestones', '◆', 'Milestones'], ['board', '🧩', 'Board'], ['workload', '👥', 'Workload'], ['risks', '⚠️', 'Risks & Issues'], ['health', '🩺', 'Plan Health'], ['settings', '⚙️', 'Settings']];
+const TABS = [['summary', '📊', 'Executive Summary'], ['wbs', '🗂️', 'WBS'], ['gantt', '📅', 'Gantt'], ['milestones', '◆', 'Milestones'], ['board', '🧩', 'Board'], ['resources', '🧑‍💼', 'Resources'], ['workload', '👥', 'Workload'],['risks', '⚠️', 'Risks & Issues'], ['health', '🩺', 'Plan Health'], ['settings', '⚙️', 'Settings']];
 const ZOOMS = { Day: 22, Week: 9, Month: 2.6, Quarter: 1 };
 const MS_RE = /sign-?\s?off|final approval|kick-?\s?off|acceptance certificate/i;
 
@@ -37,8 +40,8 @@ function wcount(a, b) { let c = 0; for (let n = a; n <= b; n++) if (isWork(n)) c
 
 /* ---------- model ---------- */
 let P, I, undoStack = [], redoStack = [];
-const UI = { tab: 'summary', sel: null, level: 3, zoom: 'Month', colorBy: 'stage', links: true, labels: true, crit: false, base: false, wbsLevel: 3, msFilter: 'open', wlBy: 'owner', wlUnit: 'month', boardShow: {}, welcome: true };
-const F = { q: '', stage: '', owner: '', status: '', cat: '' };
+const UI = { tab: 'summary', sel: null, level: 3, zoom: 'Month', colorBy: 'stage', links: true, labels: true, crit: false, base: false, wbsLevel: 3, msFilter: 'open', wlBy: 'both', wlUnit: 'month', boardShow: {}, welcome: true };
+const F = { q: '', stage: '', owner: '', res: '', status: '', cat: '' };
 const collapsed = new Set();
 const scrollMem = {};
 
@@ -216,16 +219,26 @@ function adopt(p) {
   p.meta = Object.assign({ title: 'Project', subtitle: '', headline: '', projectEnd: '' }, p.meta);
   p.settings = Object.assign({ holidays: [], autoSched: true }, p.settings);
   p.risks = Array.isArray(p.risks) ? p.risks : []; p.log = Array.isArray(p.log) ? p.log : [];
+  ensureResources(p);
   P = p; index(); rollup();
+}
+const resId = () => 'res' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+function ensureResources(p) { // every name used on a task is available in the dropdowns
+  p.resources = Array.isArray(p.resources) ? p.resources : [];
+  const have = new Set(p.resources.map(r => r.name));
+  const add = (name, type) => { if (name && !have.has(name)) { have.add(name); p.resources.push({ id: resId(), name, type, person: '', notes: '' }); } };
+  uniq(p.tasks.map(t => t.owner)).forEach(n => add(n, 'Team'));
+  uniq(p.tasks.flatMap(t => [t.role, t.other])).forEach(n => add(n, 'Role'));
 }
 function load() {
   try { const raw = localStorage.getItem(KEY); if (raw) { const p = JSON.parse(raw); if (validProject(p)) { adopt(p); return true; } } } catch (e) { /* fall through to seed */ }
   adopt(buildFromRows(window.SEED_ROWS, window.SEED_SOURCE));
   return false;
 }
+const snapshot = () => JSON.stringify({ tasks: P.tasks, risks: P.risks, resources: P.resources, meta: P.meta, settings: P.settings, baseline: P.baseline });
 function logIt(label) { P.log.unshift({ at: new Date().toISOString(), what: label }); P.log.length = Math.min(P.log.length, 200); }
 function commit(label, fn) {
-  const snapShot = JSON.stringify({ tasks: P.tasks, risks: P.risks, meta: P.meta, settings: P.settings, baseline: P.baseline });
+  const snapShot = snapshot();
   if (fn() === false) { Object.assign(P, JSON.parse(snapShot)); index(); rollup(); renderAll(); return false; }
   undoStack.push(snapShot); if (undoStack.length > 40) undoStack.shift(); redoStack = [];
   logIt(label); index(); rollup(); save(); renderAll();
@@ -233,7 +246,7 @@ function commit(label, fn) {
 }
 function restore(from, to, name) {
   if (!from.length) return toast('Nothing to ' + name);
-  to.push(JSON.stringify({ tasks: P.tasks, risks: P.risks, meta: P.meta, settings: P.settings, baseline: P.baseline }));
+  to.push(snapshot());
   Object.assign(P, JSON.parse(from.pop())); index(); rollup(); save(); renderAll();
   toast(name === 'undo' ? 'Undone' : 'Redone');
 }
@@ -310,11 +323,84 @@ function removeTask(t) {
   index();
 }
 
+function moveTarget(t, dir, vis) {
+  const p = parentOf(t), sibs = (p ? I.kids.get(p.id) : P.tasks.filter(x => !parentOf(x))).filter(s => !vis || vis.has(s.id));
+  const i = sibs.indexOf(t);
+  return i < 0 ? null : sibs[i + dir] || null;
+}
+function swapTasks(a, b) { // siblings trade places and WBS codes; links follow because they use task ids
+  const [first, second] = P.tasks.indexOf(a) < P.tasks.indexOf(b) ? [a, b] : [b, a];
+  const block = x => { const s = new Set([x.id, ...descendants(x).map(d => d.id)]); return P.tasks.filter(y => s.has(y.id)); };
+  const bf = block(first), bs = block(second), cf = first.wbs, cs = second.wbs, codes = new Map();
+  const recode = (list, from, to) => list.forEach(y => { const c = to + y.wbs.slice(from.length); codes.set(y.wbs, c); y.wbs = c; });
+  recode(bf, cf, cs); recode(bs, cs, cf);
+  const skip = new Set([...bf, ...bs]);
+  P.tasks = P.tasks.flatMap(x => (x === first ? bs : x === second ? bf : skip.has(x) ? [] : [x]));
+  P.risks.forEach(r => { if (codes.has(r.wbs)) r.wbs = codes.get(r.wbs); });
+  if (codes.has(F.stage)) F.stage = codes.get(F.stage);
+  index();
+}
+function moveTask(t, dir) {
+  const vis = new Set(visibleRows().map(x => x.id)), other = moveTarget(t, dir, vis.has(t.id) ? vis : null), was = t.wbs;
+  if (!other) return toast(`${was} is already ${dir < 0 ? 'first' : 'last'} under its parent`);
+  commit(`Moved ${was} ${dir < 0 ? 'up' : 'down'}`, () => { swapTasks(t, other); UI.flash = t.id; });
+  if (t.wbs !== was) toast(`${was} is now ${t.wbs}. Links and dates are unchanged.`);
+}
+const moveBtns = (t, vis) => `<button data-act="moveUp" data-id="${t.id}" data-tip="Move up" aria-label="Move up" ${moveTarget(t, -1, vis) ? '' : 'disabled'}>▲</button><button data-act="moveDown" data-id="${t.id}" data-tip="Move down" aria-label="Move down" ${moveTarget(t, 1, vis) ? '' : 'disabled'}>▼</button>`;
+
+/* ---------- resources ---------- */
+function resOptions(val) {
+  const known = P.resources.some(r => r.name === val);
+  return opt('', val || '', '— None —') + (val && !known ? opt(val, val) : '') + RES_TYPES.map(ty => {
+    const list = P.resources.filter(r => r.type === ty).sort((a, b) => a.name.localeCompare(b.name));
+    return list.length ? `<optgroup label="${ty === 'Person' ? 'People' : ty + 's'}">${list.map(r => opt(r.name, val)).join('')}</optgroup>` : '';
+  }).join('') + opt(NEW_RES, val, '＋ Add new resource…');
+}
+function dlgResource(onAdd) {
+  dialog('＋ Add a resource', `<div class="form">
+    <label class="full">Name<input name="name" required autofocus placeholder="e.g. Metadata Specialist"></label>
+    <label>Type<select name="type">${RES_TYPES.map(x => opt(x, 'Role')).join('')}</select></label>
+    <label>Assigned person (optional)<input name="person"></label>
+    <label class="full">Notes (optional)<input name="notes"></label></div>`, fd => {
+    const name = String(fd.get('name')).trim();
+    if (!name) { toast('A resource needs a name', 1); return false; }
+    if (P.resources.some(r => r.name.toLowerCase() === name.toLowerCase())) { toast(`“${name}” is already in the list`, 1); return false; }
+    commit(`Added resource “${name}”`, () => {
+      P.resources.push({ id: resId(), name, type: fd.get('type'), person: String(fd.get('person')).trim(), notes: String(fd.get('notes')).trim() });
+      if (onAdd) onAdd(name);
+    });
+  }, 'Add');
+}
+function renameResource(r, raw) {
+  const name = String(raw).trim();
+  if (!name) { toast('A resource needs a name', 1); renderView(); return; }
+  if (name === r.name) return;
+  const other = P.resources.find(x => x !== r && x.name.toLowerCase() === name.toLowerCase());
+  const to = other ? other.name : name, from = r.name;
+  commit(`Renamed resource “${from}” to “${to}”`, () => {
+    P.tasks.forEach(t => RES_FIELDS.forEach(f => { if (t[f] === from) t[f] = to; }));
+    if (other) P.resources = P.resources.filter(x => x !== r); else r.name = to;
+    if (F.res === from) F.res = to;
+  });
+  if (other) toast(`Merged “${from}” into “${to}”`);
+}
+function viewResources() {
+  const count = (name, f) => P.tasks.filter(t => t[f] === name).length;
+  const open = name => leaves().filter(t => t.status !== 'Done' && RES_FIELDS.some(f => t[f] === name)).length;
+  const list = [...P.resources].sort((a, b) => RES_TYPES.indexOf(a.type) - RES_TYPES.indexOf(b.type) || a.name.localeCompare(b.name));
+  return `<div class="bar-tools"><b>${list.length} resources</b> <span class="muted">These fill the owner, role and participant dropdowns. Renaming updates every task; renaming to an existing name merges the two.</span><span class="grow"></span><button class="btn pri" data-act="addResource">＋ Add resource</button></div>
+  <div class="scroll" data-scroll="res"><table><thead><tr><th>Name</th><th>Type</th><th>Assigned person</th><th>Notes</th><th>As owner</th><th>As role</th><th>As participant</th><th>Open tasks</th><th></th></tr></thead><tbody>
+  ${list.map(r => `<tr data-res="${esc(r.id)}"><td><input data-resf="name" value="${esc(r.name)}" aria-label="Name" style="min-width:230px"></td><td><select data-resf="type" aria-label="Type" style="width:90px">${RES_TYPES.map(x => opt(x, r.type)).join('')}</select></td><td><input data-resf="person" value="${esc(r.person)}" aria-label="Assigned person" style="min-width:140px"></td><td><input data-resf="notes" value="${esc(r.notes)}" aria-label="Notes" style="min-width:180px"></td><td>${count(r.name, 'owner') || ''}</td><td>${count(r.name, 'role') || ''}</td><td>${count(r.name, 'other') || ''}</td><td>${open(r.name) || ''}</td>
+  <td class="nowrap"><button class="btn sm" data-act="resTasks" data-id="${esc(r.id)}">View tasks</button> <button class="btn sm" data-act="delResource" data-id="${esc(r.id)}" data-tip="Delete" aria-label="Delete">🗑</button></td></tr>`).join('') || `<tr><td colspan="9"><div class="empty">No resources yet.</div></td></tr>`}
+  </tbody></table></div>`;
+}
+
 /* ---------- filtering ---------- */
-const filterActive = () => !!(F.q || F.stage || F.owner || F.status || F.cat);
+const filterActive = () => !!(F.q || F.stage || F.owner || F.res || F.status || F.cat);
 function match(t) {
   if (F.stage && stageOf(t).wbs !== F.stage) return false;
   if (F.owner && t.owner !== F.owner) return false;
+  if (F.res && !RES_FIELDS.some(f => t[f] === F.res)) return false;
   if (F.status && t.status !== F.status) return false;
   if (F.cat && t.category !== F.cat) return false;
   if (F.q) { const q = F.q.toLowerCase(); if (!(`${t.wbs} ${t.name} ${t.scope} ${t.role} ${t.owner} ${t.other}`.toLowerCase().includes(q))) return false; }
@@ -338,6 +424,7 @@ function filterBar(extra = '', withLevel = true) {
   return `<input type="search" placeholder="🔍 Search tasks…" value="${esc(F.q)}" data-filter="q" aria-label="Search tasks">
   <select data-filter="stage" aria-label="Stage">${opt('', F.stage, 'All stages')}${stages.map(s => opt(s.wbs, F.stage, `${s.wbs}. ${s.name}`)).join('')}</select>
   <select data-filter="owner" aria-label="Task owner">${opt('', F.owner, 'All owners')}${uniq(P.tasks.map(t => t.owner)).map(o => opt(o, F.owner)).join('')}</select>
+  <select data-filter="res" aria-label="Role or resource">${opt('', F.res, 'All resources')}${[...P.resources].map(r => r.name).sort((a, b) => a.localeCompare(b)).map(o => opt(o, F.res)).join('')}</select>
   <select data-filter="status" aria-label="Status">${opt('', F.status, 'All statuses')}${STATUSES.map(o => opt(o, F.status)).join('')}</select>
   <select data-filter="cat" aria-label="Category">${opt('', F.cat, 'All categories')}${uniq(P.tasks.map(t => t.category)).map(o => opt(o, F.cat)).join('')}</select>
   ${filterActive() ? '<button class="btn sm" data-act="clearFilters">✕ Clear</button>' : ''}
@@ -434,11 +521,11 @@ function stageTimeline(stages, S) {
 }
 
 function viewWbs() {
-  const rows = visibleRows(), T = todayN();
+  const rows = visibleRows(), T = todayN(), vis = new Set(rows.map(t => t.id));
   return `<div class="bar-tools">${filterBar()}<span class="grow"></span>
     <button class="btn" data-act="expandAll">Expand</button><button class="btn" data-act="collapseAll">Collapse</button>
     <button class="btn pri" data-act="addStage">＋ Stage</button></div>
-  <div class="scroll" data-scroll="wbs"><table><thead><tr><th>Task</th><th>Category</th><th>Task owner</th><th>Assigned role</th><th>Other participant</th><th>Status</th><th>%</th><th>Days</th><th>Start</th><th>End</th><th>Predecessors</th><th>SOW</th><th></th></tr></thead><tbody>
+  <div class="scroll" data-scroll="wbs"><table><thead><tr><th>Task</th><th>Category</th><th>Task owner</th><th>Assigned role</th><th>Other participant</th><th>Status</th><th>%</th><th>Days</th><th>Start</th><th>End</th><th>Predecessors</th><th></th></tr></thead><tbody>
   ${rows.map(t => {
     const sum = isSum(t), lock = sum ? 'locked' : '', late = t.status !== 'Done' && d2n(t.end) < T;
     return `<tr class="${sum ? 'sum' : ''} d${t.depth}" data-row="${t.id}">
@@ -449,9 +536,9 @@ function viewWbs() {
     <td ${sum ? 'class="locked"' : 'data-e="dur"'}>${t.dur}</td>
     <td ${sum ? 'class="locked nowrap"' : 'data-e="start" class="nowrap"'}>${fmtS(t.start)}</td>
     <td ${sum ? `class="locked nowrap ${late ? 'late' : ''}"` : `data-e="end" class="nowrap ${late ? 'late' : ''}"`}>${fmtS(t.end)}</td>
-    <td data-e="deps" class="nowrap" data-tip="${esc(t.depNote || '')}">${esc(depStr(t))}</td><td class="nowrap muted">${esc(t.sow)}</td>
-    <td><div class="row-act"><button data-act="addChild" data-id="${t.id}" data-tip="Add sub-task" aria-label="Add sub-task">＋</button><button data-act="addMsUnder" data-id="${t.id}" data-tip="Add milestone" aria-label="Add milestone">◆</button><button data-act="delTask" data-id="${t.id}" data-tip="Delete" aria-label="Delete">🗑</button></div></td></tr>`;
-  }).join('') || `<tr><td colspan="13"><div class="empty"><div class="big">🔍</div>No tasks match these filters.</div></td></tr>`}
+    <td data-e="deps" class="nowrap" data-tip="${esc(t.depNote || '')}">${esc(depStr(t))}</td>
+    <td><div class="row-act">${moveBtns(t, vis)}<button data-act="addChild" data-id="${t.id}" data-tip="Add sub-task" aria-label="Add sub-task">＋</button><button data-act="addMsUnder" data-id="${t.id}" data-tip="Add milestone" aria-label="Add milestone">◆</button><button data-act="delTask" data-id="${t.id}" data-tip="Delete" aria-label="Delete">🗑</button></div></td></tr>`;
+  }).join('') || `<tr><td colspan="12"><div class="empty"><div class="big">🔍</div>No tasks match these filters.</div></td></tr>`}
   </tbody></table></div>`;
 }
 function startCellEdit(td) {
@@ -459,6 +546,7 @@ function startCellEdit(td) {
   if (td.querySelector('input,select')) return;
   let ed;
   if (f === 'status') ed = `<select>${STATUSES.map(s => opt(s, t.status)).join('')}</select>`;
+  else if (RES_FIELDS.includes(f)) ed = `<select style="min-width:170px">${resOptions(t[f])}</select>`;
   else if (f === 'start' || f === 'end') ed = `<input type="date" value="${t[f]}">`;
   else if (f === 'dur' || f === 'progress') ed = `<input type="number" min="0" ${f === 'progress' ? 'max="100"' : ''} value="${t[f]}" style="width:60px">`;
   else if (f === 'deps') ed = `<input value="${esc(depStr(t))}" placeholder="1.2; 1.3 (SS)+2" style="width:150px">`;
@@ -469,6 +557,7 @@ function startCellEdit(td) {
   const finish = ok => {
     if (done) return; done = true;
     const v = el.value;
+    if (ok && v === NEW_RES) { renderView(); dlgResource(name => setField(t, f, name)); return; }
     if (ok && String(v) !== String(f === 'deps' ? depStr(t) : t[f])) {
       if (!commit(`Changed ${f} of ${t.wbs}`, () => setField(t, f, v))) renderView();
     } else renderView();
@@ -492,7 +581,7 @@ function viewGantt() {
     <button class="btn sm" data-act="scrollToday">📍 Today</button>
     <label>Colour <select data-act-change="colorBy">${[['stage', 'Stage'], ['status', 'Status'], ['owner', 'Owner']].map(([v, l]) => opt(v, UI.colorBy, l)).join('')}</select></label>
     <button class="btn sm ${UI.links ? 'on' : ''}" data-act="flag" data-k="links">🔗 Links</button>
-    <button class="btn sm ${UI.labels ? 'on' : ''}" data-act="flag" data-k="labels">🏷 Labels</button>
+    <button class="btn sm ${UI.labels ? 'on' : ''}" data-act="flag" data-k="labels" data-tip="Shows each task's assigned role. Tasks with no role show their owner in italics.">🏷 Role labels</button>
     <button class="btn sm ${UI.base ? 'on' : ''}" data-act="flag" data-k="base" data-tip="Grey line under each bar = saved baseline">📐 Baseline</button>
     <button class="btn sm ${UI.crit ? 'on' : ''}" data-act="flag" data-k="crit" data-tip="Chain of tasks driving the finish of the selected task (or stage 7 if none is selected)">🔥 Critical path</button>
     <span class="grow"></span>
@@ -501,7 +590,7 @@ function viewGantt() {
     <button class="btn sm pri" data-act="addTaskDlg">＋ Task</button>
   </div>
   <div class="g-wrap" id="gWrap" data-scroll="gantt"><div class="g-in" id="gIn"></div></div>
-  <div class="legend mt"><span>Drag a bar to move it · drag its right edge to resize · drag the ○ at its end onto another bar to link them · click a link to edit it</span>
+  <div class="legend mt"><span>Drag a bar to move it · drag its right edge to resize · drag the ○ at its end onto another bar to link them · click a link to edit it · hover a task name for ▲▼ to reorder</span><span>Labels: assigned role; <i style="all:unset;font-style:italic">owner in italics</i> if no role is set</span>
     <span><i style="background:var(--today)"></i>Today</span><span><i style="background:var(--warn)"></i>Project end</span><span style="color:var(--ink2)">◆ Milestone</span></div>`;
 }
 function barColor(t) {
@@ -572,7 +661,7 @@ function renderGantt() {
   const base = P.baseline && P.baseline.map;
   const barsHtml = rows.map((t, i) => {
     const y = i * rh, a = x(d2n(t.start)), b = Math.max(x(d2n(t.end) + 1), a + 3), w = b - a, col = barColor(t), sum = isSum(t), cy = y + rh / 2;
-    const tip = `${t.wbs} ${t.name}\n${fmt(t.start)} → ${fmt(t.end)} (${t.dur} workdays)\n${t.status} · ${t.progress}%${t.owner ? '\n' + t.owner : ''}`;
+    const tip = `${t.wbs} ${t.name}\n${fmt(t.start)} → ${fmt(t.end)} (${t.dur} workdays)\n${t.status} · ${t.progress}%${t.owner ? '\nOwner: ' + t.owner : ''}${t.role ? '\nRole: ' + t.role : ''}`;
     const inCrit = cc && cc.chain.has(t.id);
     let s = `<g class="bar" data-id="${t.id}" data-tip="${esc(tip)}">`;
     if (UI.base && base && base[t.id]) { const bx = x(d2n(base[t.id][0])), be = x(d2n(base[t.id][1]) + 1); s += `<rect class="base" x="${bx}" y="${y + rh - 7}" width="${Math.max(be - bx, 2)}" height="3" rx="1.5"/>`; }
@@ -587,15 +676,17 @@ function renderGantt() {
     let right = b;
     if (t.ms) { const mx = x(d2n(t.end)) + ppd / 2 + (milestoneOnly ? 0 : ppd / 2); s += `<path class="dia" data-h="${sum ? 'none' : 'move'}" d="M${mx} ${cy - 8}L${mx + 8} ${cy}L${mx} ${cy + 8}L${mx - 8} ${cy}Z" fill="${t.status === 'Done' ? 'var(--st-dn)' : inCrit ? 'var(--crit)' : 'var(--s4)'}"/>`; right = Math.max(b, mx + 8); }
     s += `<rect x="${right}" y="${cy - 8}" width="16" height="16" fill="transparent" data-h="none"/><circle class="lnk" data-h="link" cx="${right + 9}" cy="${cy}" r="5"/>`;
-    if (UI.labels) s += `<text class="lbl" x="${right + 18}" y="${cy + 4}">${esc(t.name.length > 46 ? t.name.slice(0, 45) + '…' : t.name)}</text>`;
+    const lab = t.role || t.owner;
+    if (UI.labels && lab) s += `<text class="lbl ${t.role ? '' : 'alt'}" x="${right + 18}" y="${cy + 4}">${esc(lab.length > 46 ? lab.slice(0, 45) + '…' : lab)}</text>`;
     return s + '</g>';
   }).join('');
   const rowLines = rows.map((t, i) => (t.id === UI.sel ? `<rect class="selb" x="0" y="${i * rh}" width="${W}" height="${rh}"/>` : '') + `<line class="rl" x1="0" x2="${W}" y1="${(i + 1) * rh - .5}" y2="${(i + 1) * rh - .5}"/>`).join('');
   const peLine = P.meta.projectEnd && d2n(P.meta.projectEnd) >= r0 && d2n(P.meta.projectEnd) <= r1 ? `<line class="pe" x1="${x(d2n(P.meta.projectEnd))}" x2="${x(d2n(P.meta.projectEnd))}" y1="0" y2="${H}"/>` : '';
   const todayLine = T >= r0 && T <= r1 ? `<line class="today" x1="${x(T) + ppd / 2}" x2="${x(T) + ppd / 2}" y1="0" y2="${H}"/>` : '';
 
-  const left = rows.map(t => `<div class="g-row ${isSum(t) ? 'sum' : ''} ${t.id === UI.sel ? 'sel' : ''}" style="padding-left:${(t.depth - 1) * 11 + 4}px">
-    <button class="caret ${isSum(t) ? '' : 'none'}" data-act="toggle" data-id="${t.id}" aria-label="Expand or collapse">${collapsed.has(t.id) && !filterActive() ? '▶' : '▼'}</button><code>${esc(t.wbs)}</code>${t.ms ? '<span class="ms">◆</span>' : ''}<span class="txt" data-open="${t.id}" data-tip="${esc(t.name)}">${esc(t.name)}</span><span data-tip="${esc(t.status)}" style="color:${stColor(t.status)};font-size:11px">${ST_META[t.status][0]}</span></div>`).join('');
+  const vis = new Set(rows.map(t => t.id));
+  const left = rows.map(t => `<div class="g-row ${isSum(t) ? 'sum' : ''} ${t.id === UI.sel ? 'sel' : ''}" data-row="${t.id}" style="padding-left:${(t.depth - 1) * 11 + 4}px">
+    <button class="caret ${isSum(t) ? '' : 'none'}" data-act="toggle" data-id="${t.id}" aria-label="Expand or collapse">${collapsed.has(t.id) && !filterActive() ? '▶' : '▼'}</button><code>${esc(t.wbs)}</code>${t.ms ? '<span class="ms">◆</span>' : ''}<span class="txt" data-open="${t.id}" data-tip="${esc(t.name)}">${esc(t.name)}</span><span class="g-mv">${moveBtns(t, vis)}</span><span data-tip="${esc(t.status)}" style="color:${stColor(t.status)};font-size:11px">${ST_META[t.status][0]}</span></div>`).join('');
 
   const st = { l: wrap.scrollLeft, t: wrap.scrollTop };
   $('#gIn').innerHTML = `<div class="g-left"><div class="g-lh">Task</div>${left || '<div class="empty">No tasks match.</div>'}</div>
@@ -665,7 +756,6 @@ function renderDrawer() {
   const dr = $('#drawer'), t = UI.sel && I.byId.get(UI.sel);
   if (!t) { dr.hidden = true; dr.innerHTML = ''; return; }
   const sum = isSum(t), dis = sum ? 'disabled' : '', par = parentOf(t);
-  const taskOpts = uniq(P.tasks.map(x => x.owner));
   const dl = P.tasks.filter(x => x !== t).map(x => `<option value="${esc(x.wbs)}">${esc(x.name.slice(0, 70))}</option>`).join('');
   const depRow = (d, succ) => {
     const o = I.byId.get(d.id);
@@ -682,16 +772,15 @@ function renderDrawer() {
     <label>Progress %<input type="number" min="0" max="100" data-f="progress" value="${t.progress}" ${dis}></label>
     <label>Status<select data-f="status" ${dis}>${STATUSES.map(s => opt(s, t.status)).join('')}</select></label>
     <label>Category<input data-f="category" value="${esc(t.category)}" list="dlCats"></label>
-    <label>Task owner<input data-f="owner" value="${esc(t.owner)}" list="dlOwners"></label>
-    <label>Assigned role<input data-f="role" value="${esc(t.role)}"></label>
-    <label class="full">Other participant<input data-f="other" value="${esc(t.other)}"></label>
+    <label>Task owner<select data-f="owner">${resOptions(t.owner)}</select></label>
+    <label>Assigned role<select data-f="role">${resOptions(t.role)}</select></label>
+    <label class="full">Other participant<select data-f="other">${resOptions(t.other)}</select></label>
     <label>WBS code<input data-f="wbs" value="${esc(t.wbs)}" ${dis}></label>
     <label>SOW reference<input data-f="sow" value="${esc(t.sow)}"></label>
     <label class="full" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" data-f="ms" ${t.ms ? 'checked' : ''} style="width:auto"> ◆ Mark as a milestone</label>
     <label class="full">Scope &amp; deliverable<textarea data-f="scope" rows="3">${esc(t.scope)}</textarea></label>
     <label class="full">Notes<textarea data-f="notes" rows="2" placeholder="Anything the team should know…">${esc(t.notes)}</textarea></label>
   </div>
-  <datalist id="dlOwners">${taskOpts.map(o => `<option value="${esc(o)}">`).join('')}</datalist>
   <datalist id="dlCats">${uniq(P.tasks.map(x => x.category)).map(o => `<option value="${esc(o)}">`).join('')}</datalist>
   <datalist id="dlTasks">${dl}</datalist>
   <div class="section-t">⬅ Depends on (predecessors) <small style="font-weight:400">— type · lag in workdays</small></div>
@@ -703,7 +792,7 @@ function renderDrawer() {
   <div class="dep-add" style="grid-template-columns:1fr 62px 58px auto"><input id="addSucc" list="dlTasks" placeholder="WBS code of next task" aria-label="Successor WBS code"><select id="addSuccType" aria-label="Type">${DEP_TYPES.map(x => opt(x, 'FS')).join('')}</select><input id="addSuccLag" type="number" value="0" aria-label="Lag"><button class="btn sm" data-act="addSucc" data-id="${t.id}">Add</button></div>
   ${t.qa ? `<div class="section-t">Main QA / consultancy tasks</div><div class="ink2" style="font-size:12.5px">${esc(t.qa)}</div>` : ''}
   ${t.note ? `<div class="section-t">Status note</div><div class="ink2" style="font-size:12.5px">${esc(t.note)}</div>` : ''}
-  <div class="dlg-actions" style="justify-content:space-between"><button class="btn danger" data-act="delTask" data-id="${t.id}">🗑 Delete</button><span><button class="btn" data-act="addChild" data-id="${t.id}">＋ Sub-task</button> <button class="btn" data-act="addMsUnder" data-id="${t.id}">◆ Milestone</button></span></div>`;
+  <div class="dlg-actions" style="justify-content:space-between"><button class="btn danger" data-act="delTask" data-id="${t.id}">🗑 Delete</button><span><button class="btn icon" data-act="moveUp" data-id="${t.id}" data-tip="Move up" aria-label="Move up">▲</button> <button class="btn icon" data-act="moveDown" data-id="${t.id}" data-tip="Move down" aria-label="Move down">▼</button> <button class="btn" data-act="addChild" data-id="${t.id}">＋ Sub-task</button> <button class="btn" data-act="addMsUnder" data-id="${t.id}">◆ Milestone</button></span></div>`;
   dr.hidden = false;
 }
 
@@ -735,9 +824,7 @@ function viewBoard() {
   }).join('')}</div>`;
 }
 function viewWorkload() {
-  const key = { owner: 'owner', role: 'role', other: 'other' }[UI.wlBy];
   const ls = leaves().filter(match);
-  const groups = uniq(ls.map(t => t[key] || '(Unassigned)'));
   const T = todayN(), t0 = new Date(T * 864e5);
   const periods = [];
   if (UI.wlUnit === 'month') {
@@ -746,12 +833,19 @@ function viewWorkload() {
     const S = planStats(); let d = new Date(d2n(S.start) * 864e5); d = new Date(Date.UTC(d.getUTCFullYear(), Math.floor(d.getUTCMonth() / 3) * 3, 1));
     while (d.getTime() / 864e5 <= d2n(S.finish)) { const a = d.getTime() / 864e5, nx = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 3, 1)); periods.push({ a, b: nx.getTime() / 864e5 - 1, l: `Q${d.getUTCMonth() / 3 + 1} ${String(d.getUTCFullYear()).slice(2)}` }); d = nx; }
   }
-  const data = groups.map(g => periods.map(p => ls.filter(t => (t[key] || '(Unassigned)') === g && t.status !== 'Done' && d2n(t.start) <= p.b && d2n(t.end) >= p.a).length));
-  const max = Math.max(1, ...data.flat());
-  return `<div class="bar-tools">${filterBar(`<label>Group by <select data-act-change="wlBy">${[['owner', 'Task owner'], ['role', 'Assigned role'], ['other', 'Other participant']].map(([v, l]) => opt(v, UI.wlBy, l)).join('')}</select></label><label>Period <select data-act-change="wlUnit">${[['month', 'Next 24 months'], ['quarter', 'Quarters (whole plan)']].map(([v, l]) => opt(v, UI.wlUnit, l)).join('')}</select></label>`, false)}</div>
-  <div class="scroll"><table class="heat"><thead><tr><th>Open tasks active in period</th>${periods.map(p => `<th>${p.l}</th>`).join('')}</tr></thead><tbody>
-  ${groups.map((g, i) => `<tr><td data-tip="${esc(g)}">${esc(g)}</td>${data[i].map((v, j) => `<td style="background:${v ? `color-mix(in srgb,var(--s1) ${Math.round(8 + 62 * v / max)}%,transparent)` : 'transparent'}" data-tip="${esc(g)}\n${periods[j].l}: ${v} open task${v === 1 ? '' : 's'}">${v || ''}</td>`).join('')}</tr>`).join('') || `<tr><td>No tasks match.</td></tr>`}
-  </tbody></table></div><div class="legend mt"><span>Darker = more open tasks running at the same time (max ${max}). Use it to spot overloaded teams.</span></div>`;
+  const NONE = '(Unassigned)';
+  const heat = (key, title, stacked) => {
+    const groups = uniq(ls.map(t => t[key])); if (ls.some(t => !t[key])) groups.push(NONE); // unassigned goes last
+    const data = groups.map(g => periods.map(p => ls.filter(t => (t[key] || NONE) === g && t.status !== 'Done' && d2n(t.start) <= p.b && d2n(t.end) >= p.a).length));
+    const max = Math.max(1, ...data.filter((_, i) => groups[i] !== NONE || groups.length === 1).flat()); // a large unassigned row must not wash out the rest
+    return `<h3 class="wl-t">${title}</h3><div class="scroll" data-scroll="wl-${key}"${stacked ? ' style="max-height:none"' : ''}><table class="heat"><thead><tr><th>Open tasks active in period</th>${periods.map(p => `<th>${p.l}</th>`).join('')}</tr></thead><tbody>
+    ${groups.map((g, i) => `<tr><td data-tip="${esc(g)}">${esc(g)}</td>${data[i].map((v, j) => `<td style="background:${v ? `color-mix(in srgb,var(--s1) ${Math.round(8 + 62 * Math.min(1, v / max))}%,transparent)` : 'transparent'}" data-tip="${esc(g)}\n${periods[j].l}: ${v} open task${v === 1 ? '' : 's'}">${v || ''}</td>`).join('')}</tr>`).join('') || `<tr><td>No tasks match.</td></tr>`}
+    </tbody></table></div><div class="legend" style="margin-top:6px"><span>Darker = more open tasks at the same time (busiest assigned cell: ${max}).</span></div>`;
+  };
+  const both = UI.wlBy === 'both';
+  const LABEL = { owner: 'By task owner', role: 'By assigned role', other: 'By other participant' };
+  return `<div class="bar-tools">${filterBar(`<label>Show <select data-act-change="wlBy">${[['both', 'Owner and role'], ['owner', 'Task owner'], ['role', 'Assigned role'], ['other', 'Other participant']].map(([v, l]) => opt(v, UI.wlBy, l)).join('')}</select></label><label>Period <select data-act-change="wlUnit">${[['month', 'Next 24 months'], ['quarter', 'Quarters (whole plan)']].map(([v, l]) => opt(v, UI.wlUnit, l)).join('')}</select></label>`, false)}</div>
+  ${(both ? ['owner', 'role'] : [UI.wlBy]).map(k => heat(k, LABEL[k], both)).join('')}`;
 }
 function viewRisks() {
   const rs = P.risks;
@@ -809,7 +903,7 @@ function viewSettings() {
 }
 
 /* ---------- rendering ---------- */
-const VIEWS = { summary: viewSummary, wbs: viewWbs, gantt: viewGantt, milestones: viewMilestones, board: viewBoard, workload: viewWorkload, risks: viewRisks, health: viewHealth, settings: viewSettings };
+const VIEWS = { summary: viewSummary, wbs: viewWbs, gantt: viewGantt, milestones: viewMilestones, board: viewBoard, resources: viewResources, workload: viewWorkload, risks: viewRisks, health: viewHealth, settings: viewSettings };
 function renderTabs() {
   const S = healthChecks().filter(c => c.sev === 'bad').length;
   $('#tabs').innerHTML = TABS.map(([id, ic, l]) => `<button role="tab" aria-selected="${UI.tab === id}" data-act="goto" data-tab="${id}">${ic} ${l}${id === 'health' && S ? `<span class="count">${S}</span>` : ''}</button>`).join('');
@@ -821,6 +915,10 @@ function renderView() {
   if (UI.tab === 'gantt') renderGantt();
   $$('[data-scroll]').forEach(el => { const m = scrollMem[el.dataset.scroll]; if (m) { el.scrollLeft = m[0]; el.scrollTop = m[1]; } });
   if (UI.tab === 'gantt' && !scrollMem.gantt) scrollGanttToToday();
+  if (UI.flash) { // keep a moved row in view and show where it landed
+    const el = $(`#view [data-row="${UI.flash}"]`), box = el && el.closest('[data-scroll]'); UI.flash = null;
+    if (el) { const l = box ? box.scrollLeft : 0; el.scrollIntoView({ block: 'nearest' }); if (box) box.scrollLeft = l; el.classList.add('flash'); }
+  }
 }
 function renderGanttFresh() { // timeline range changes, so the old scroll offset is meaningless
   $('#view').innerHTML = VIEWS.gantt(); renderGantt(); delete scrollMem.gantt; scrollGanttToToday();
@@ -881,7 +979,9 @@ function dlgHelp() {
   dialog('👋 Quick guide', `<ul class="help" style="padding-left:18px;margin:0">
   <li><b>Open a task:</b> click its name anywhere to edit all its details in the side panel.</li>
   <li><b>WBS:</b> click a cell to edit it. Use ＋ on a row to add a sub-task and ◆ for a milestone. Grey summary values roll up automatically.</li>
-  <li><b>Move tasks:</b> on the Gantt, drag a bar to move it and drag its right edge to resize.</li>
+  <li><b>Change dates:</b> on the Gantt, drag a bar to move it and drag its right edge to resize.</li>
+  <li><b>Reorder tasks:</b> use ▲▼ on a row in the WBS or Gantt. A task moves among the tasks under the same parent and trades WBS codes with its neighbour. Links and dates stay the same.</li>
+  <li><b>Resources:</b> pick owners, roles and participants from the dropdowns. Add to the list on the Resources tab, or with “Add new resource” in any dropdown.</li>
   <li><b>Add dependencies:</b> hover a bar and drag the ○ onto the next task, or use Manage dependencies. Types: FS, SS, FF, SF, with lag in workdays.</li>
   <li><b>Milestones:</b> use ◆ Add milestone, or tick “Mark as a milestone” on any task.</li>
   <li><b>Auto-scheduling:</b> when a task moves, the tasks that depend on it are pushed later if needed. Turn this off in Settings.</li>
@@ -903,7 +1003,7 @@ function exportJson() { save(); download(`NSDI_Plan_${stamp()}.json`, new Blob([
 function loadProjectObject(obj, name) {
   const p = obj && obj.project ? obj.project : obj;
   if (!validProject(p)) { toast('That file is not a valid project file', 1); return false; }
-  if (undoStack.length < 40) undoStack.push(JSON.stringify({ tasks: P.tasks, risks: P.risks, meta: P.meta, settings: P.settings, baseline: P.baseline }));
+  if (undoStack.length < 40) undoStack.push(snapshot());
   adopt(p); logIt('Loaded ' + name); save(); setLevel(UI.level); UI.sel = null; renderAll(); toast('Loaded ' + name);
   return true;
 }
@@ -922,6 +1022,7 @@ function exportXlsx() {
   const dp = []; P.tasks.forEach(s => s.deps.forEach(d => { const p = I.byId.get(d.id); dp.push([p.wbs, p.name, s.wbs, s.name, d.type, d.lag || 0]); }));
   X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['From WBS', 'From task', 'To WBS', 'To task', 'Type', 'Lag (workdays)'], ...dp]), 'Dependencies');
   X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['WBS', 'Milestone', 'Date', 'Owner', 'Status'], ...P.tasks.filter(t => t.ms).map(t => [t.wbs, t.name, dc(t.end), t.owner, t.status])]), 'Milestones');
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['Name', 'Type', 'Assigned person', 'Notes'], ...P.resources.map(r => [r.name, r.type, r.person, r.notes])]), 'Resources');
   X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['Type', 'Title', 'WBS', 'Owner', 'Probability', 'Impact', 'Score', 'Status', 'Due', 'Mitigation'], ...P.risks.map(r => [r.type, r.title, r.wbs, r.owner, r.prob, r.impact, (+r.prob || 0) * (+r.impact || 0), r.status, r.due, r.plan])]), 'Risks & Issues');
   X.writeFile(wb, `NSDI_Plan_${stamp()}.xlsx`);
   toast('Excel file exported');
@@ -950,7 +1051,7 @@ function importWorkbook(buf, name) {
   dialog('📥 Import from Excel', `<p>Found <b>${rows.length}</b> tasks in “${esc(wsName)}” of ${esc(name)}. This replaces the plan in this browser; you can undo it right after.</p>`, () => {
     const np = buildFromRows(rows, name);
     np.meta = Object.assign({}, P.meta, { source: name });
-    np.risks = P.risks;
+    np.risks = P.risks; np.resources = P.resources;
     rows.forEach((r, i) => { const t = np.tasks[i]; if (!t) return; if (r._p !== '' && r._p != null && !isNaN(+r._p)) t.progress = clamp(+r._p, 0, 100); if (String(r._m).toLowerCase() === 'yes') t.ms = true; if (r._n) t.notes = String(r._n); });
     loadProjectObject(np, name);
   }, 'Replace plan');
@@ -996,6 +1097,20 @@ const ACTIONS = {
   scrollToday: scrollGanttToToday,
   flag: el => { UI[el.dataset.k] = !UI[el.dataset.k]; renderView(); saveUI(); },
   closeDrawer: () => { UI.sel = null; renderDrawer(); if (UI.tab === 'gantt') renderGantt(); },
+  moveUp: el => moveTask(I.byId.get(el.dataset.id), -1),
+  moveDown: el => moveTask(I.byId.get(el.dataset.id), 1),
+  addResource: () => dlgResource(),
+  resTasks: el => { const r = P.resources.find(x => x.id === el.dataset.id); Object.keys(F).forEach(k => { F[k] = ''; }); F.res = r.name; UI.tab = 'wbs'; renderTabs(); renderView(); saveUI(); },
+  delResource: el => {
+    const r = P.resources.find(x => x.id === el.dataset.id), n = P.tasks.filter(t => RES_FIELDS.some(f => t[f] === r.name)).length;
+    dialog('Delete this resource?', `<p><b>${esc(r.name)}</b> will be removed from the list${n ? ` and cleared from ${n} task${n > 1 ? 's' : ''}` : ''}. You can undo this.</p>`, () => {
+      commit(`Deleted resource “${r.name}”`, () => {
+        P.tasks.forEach(t => RES_FIELDS.forEach(f => { if (t[f] === r.name) t[f] = ''; }));
+        P.resources = P.resources.filter(x => x !== r);
+        if (F.res === r.name) F.res = '';
+      });
+    }, 'Delete');
+  },
   addStage: () => dialog('＋ Add a stage', `<div class="form"><label class="full">Stage name<input name="name" required autofocus></label><label>Start<input type="date" name="date" value="${n2d(snap(todayN()))}" required></label></div>`, fd => { commit(`Added stage “${fd.get('name')}”`, () => { const t = addTask(null, { name: String(fd.get('name')), start: fd.get('date'), category: 'Phase', dur: 5 }); UI.sel = t.id; }); }, 'Add'),
   addTaskDlg: () => dlgAddTask(false, UI.sel ? I.byId.get(UI.sel) : null),
   addMilestone: () => dlgAddTask(true, UI.sel ? I.byId.get(UI.sel) : null),
@@ -1059,6 +1174,7 @@ document.addEventListener('change', async e => {
   if (ds.f) {
     const form = el.closest('[data-task]'), t = I.byId.get(form.dataset.task);
     const v = el.type === 'checkbox' ? el.checked : el.value;
+    if (v === NEW_RES) { el.value = t[ds.f]; dlgResource(name => setField(t, ds.f, name)); return; }
     if (!commit(`Changed ${ds.f} of ${t.wbs}`, () => setField(t, ds.f, v))) renderDrawer();
     return;
   }
@@ -1068,6 +1184,12 @@ document.addEventListener('change', async e => {
     return;
   }
   if (ds.rf) { const r = P.risks.find(x => x.id === el.closest('[data-risk]').dataset.risk); commit('Edited a log entry', () => { r[ds.rf] = el.value; }); return; }
+  if (ds.resf) {
+    const r = P.resources.find(x => x.id === el.closest('[data-res]').dataset.res);
+    if (ds.resf === 'name') renameResource(r, el.value);
+    else commit(`Edited resource “${r.name}”`, () => { r[ds.resf] = el.value.trim(); });
+    return;
+  }
   if (ds.metaIn) { commit(`Changed project ${ds.metaIn}`, () => { P.meta[ds.metaIn] = el.value; }); return; }
   if (el.id === 'autoSched') { commit('Changed auto-scheduling', () => { P.settings.autoSched = el.checked; }); return; }
   if (el.id === 'holidays') {
@@ -1124,5 +1246,5 @@ setLevel(UI.level);
 renderAll();
 setSaved(hadLocal ? 'Restored from this browser' : 'Plan loaded from ' + (P.meta.source || 'workbook'));
 checkPublished();
-window.__planner = { get P() { return P; }, get I() { return I; }, healthChecks, planStats, drivingChain, propagate, linkError };
+window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError };
 })();
