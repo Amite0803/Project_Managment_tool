@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NSDI Geoportal Planner</title>
+<meta name="description" content="Task and timeline management for the NSDI & Geoportal project: WBS, executive summary, Gantt, milestones and more.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗺️</text></svg>">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo" aria-hidden="true">🗺️</span><div><b id="appTitle">NSDI Geoportal Planner</b><small id="saveState">Ready</small></div></div>
+  <div class="top-actions">
+    <button class="btn icon" data-act="undo" data-tip="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
+    <button class="btn icon" data-act="redo" data-tip="Redo (Ctrl+Y)" aria-label="Redo">↷</button>
+    <details class="menu">
+      <summary class="btn">📁 File</summary>
+      <div class="menu-pop">
+        <button data-act="saveJson">💾 Save project file (.json)</button>
+        <button data-act="loadJson">📂 Open project file</button>
+        <hr>
+        <button data-act="exportXlsx">📗 Export to Excel</button>
+        <button data-act="importXlsx">📥 Import from Excel</button>
+        <hr>
+        <button data-act="print">🖨️ Print / save as PDF</button>
+      </div>
+    </details>
+    <button class="btn" data-act="share">🔗 Share</button>
+    <button class="btn icon" data-act="help" data-tip="Quick guide" aria-label="Quick guide">?</button>
+    <button class="btn icon" data-act="theme" data-tip="Light / dark" aria-label="Toggle light or dark theme">◐</button>
+  </div>
+</header>
+<nav class="tabs" role="tablist" aria-label="Views" id="tabs"></nav>
+<div id="banner"></div>
+<main id="view" tabindex="-1"></main>
+<aside id="drawer" class="drawer" aria-label="Task details" hidden></aside>
+<dialog id="modal"></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="tip" role="tooltip" hidden></div>
+<input type="file" id="fileJson" accept=".json,application/json" hidden>
+<input type="file" id="fileXlsx" accept=".xlsx,.xlsm" hidden>
+<script src="lib/xlsx.full.min.js" defer></script>
+<script src="data.js" defer></script>
+<script src="app.js" defer></script>
+</body>
+</html>

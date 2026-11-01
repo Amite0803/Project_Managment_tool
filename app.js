@@ -1,0 +1,1128 @@
+(() => {
+'use strict';
+const KEY = 'nsdi-planner-v1', UI_KEY = 'nsdi-planner-ui';
+const STATUSES = ['Not started', 'Ongoing', 'Review and QA', 'On hold', 'Done'];
+const ST_META = { 'Not started': ['○', '--st-ns', 0], 'Ongoing': ['◔', '--st-on', 50], 'Review and QA': ['◑', '--st-qa', 90], 'On hold': ['⏸', '--st-hd', null], 'Done': ['✓', '--st-dn', 100] };
+const DEP_TYPES = ['FS', 'SS', 'FF', 'SF'];
+const DEP_LABEL = { FS: 'Finish → Start', SS: 'Start → Start', FF: 'Finish → Finish', SF: 'Start → Finish' };
+const TABS = [['summary', '📊', 'Executive Summary'], ['wbs', '🗂️', 'WBS'], ['gantt', '📅', 'Gantt'], ['milestones', '◆', 'Milestones'], ['board', '🧩', 'Board'], ['workload', '👥', 'Workload'], ['risks', '⚠️', 'Risks & Issues'], ['health', '🩺', 'Plan Health'], ['settings', '⚙️', 'Settings']];
+const ZOOMS = { Day: 22, Week: 9, Month: 2.6, Quarter: 1 };
+const MS_RE = /sign-?\s?off|final approval|kick-?\s?off|acceptance certificate/i;
+
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+/* ---------- dates: integers = days since epoch, ISO strings in the model ---------- */
+const d2n = s => { const [y, m, d] = String(s).split('-').map(Number); return Math.floor(Date.UTC(y, m - 1, d) / 864e5); };
+const n2d = n => new Date(n * 864e5).toISOString().slice(0, 10);
+const isISO = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '') && !isNaN(d2n(s));
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const fmt = s => { if (!s) return '—'; const [y, m, d] = s.split('-'); return `${+d} ${MONTHS[+m - 1]} ${y}`; };
+const fmtS = s => { if (!s) return '—'; const [y, m, d] = s.split('-'); return `${+d} ${MONTHS[+m - 1]} ${y.slice(2)}`; };
+const todayN = () => { const t = new Date(); return Math.floor(Date.UTC(t.getFullYear(), t.getMonth(), t.getDate()) / 864e5); };
+const dow = n => (n + 4) % 7;
+let holidaySet = new Set();
+const isWork = n => { const w = dow(n); return w !== 0 && w !== 6 && !holidaySet.has(n); };
+const snap = n => { while (!isWork(n)) n++; return n; };
+function wshift(n, k) {
+  if (k === 0) return snap(n);
+  const dir = k > 0 ? 1 : -1;
+  let left = Math.abs(k);
+  while (left > 0) { n += dir; if (isWork(n)) left--; }
+  return n;
+}
+function wcount(a, b) { let c = 0; for (let n = a; n <= b; n++) if (isWork(n)) c++; return c; }
+
+/* ---------- model ---------- */
+let P, I, undoStack = [], redoStack = [];
+const UI = { tab: 'summary', sel: null, level: 3, zoom: 'Month', colorBy: 'stage', links: true, labels: true, crit: false, base: false, wbsLevel: 3, msFilter: 'open', wlBy: 'owner', wlUnit: 'month', boardShow: {}, welcome: true };
+const F = { q: '', stage: '', owner: '', status: '', cat: '' };
+const collapsed = new Set();
+const scrollMem = {};
+
+function parseDepString(str) {
+  const deps = [], notes = [];
+  String(str || '').split(/;|,(?=\s*\d)/).forEach(raw => {
+    const s = raw.trim(); if (!s) return;
+    const m = s.match(/^(\d+(?:\.\d+)*)\s*(?:\((FS|SS|FF|SF)\))?\s*(?:([+-])\s*(\d+)\s*d?)?\s*(.*)$/i);
+    if (!m) { notes.push(s); return; }
+    deps.push({ code: m[1], type: (m[2] || 'FS').toUpperCase(), lag: m[4] ? (m[3] === '-' ? -1 : 1) * +m[4] : 0 });
+    const tail = m[5].replace(/^[–—\-\s]+/, '').trim();
+    if (tail) notes.push(tail);
+  });
+  return { deps, notes };
+}
+function isAncestorCode(a, b) { return b.startsWith(a + '.'); }
+
+function buildFromRows(rows, source) {
+  const seen = new Set();
+  const tasks = rows.filter(r => String(r.wbs || '').trim()).map((r, i) => {
+    const status = STATUSES.includes(r.status) ? r.status : 'Not started';
+    const dur = r.dur === '' || r.dur == null ? 0 : Math.round(+r.dur) || 0;
+    const wbs = String(r.wbs).trim();
+    const t = { id: 't' + i, wbs, name: r.name || '(untitled)', category: r.category || '', scope: r.scope || '', owner: r.owner || '', role: r.role || '', other: r.other || '', note: r.note || '', status, srcStatus: r.status || '', progress: ST_META[status][2] || 0, dur, start: r.start, end: r.end, srcStart: r.start, srcEnd: r.end, srcDur: dur, deps: [], depNote: '', depRaw: r.deps || '', sow: r.sow || '', qa: r.qa || '', ms: false, notes: '', dup: seen.has(wbs) };
+    seen.add(wbs);
+    return t;
+  });
+  const byCode = new Map(); tasks.forEach(t => { if (!byCode.has(t.wbs)) byCode.set(t.wbs, t); });
+  let dropped = 0;
+  tasks.forEach(t => {
+    const { deps, notes } = parseDepString(t.depRaw);
+    deps.forEach(d => {
+      const p = byCode.get(d.code);
+      if (!p) { notes.push('Unknown predecessor ' + d.code); return; }
+      if (p === t || isAncestorCode(p.wbs, t.wbs) || isAncestorCode(t.wbs, p.wbs)) { dropped++; return; } // parent/child link is implied by the hierarchy
+      t.deps.push({ id: p.id, type: d.type, lag: d.lag });
+    });
+    t.depNote = notes.filter(n => !/^\(?summary/i.test(n) && !/^project start$/i.test(n)).join('; ');
+    t.ms = (MS_RE.test(t.name)) || (t.dur === 0 && t.category !== 'Expense' && !byCode.has(t.wbs + '.1'));
+  });
+  return {
+    meta: { title: 'NSDI & Geoportal Project', subtitle: 'QA & Consultancy – task and timeline plan', headline: 'End-to-end delivery of the National Spatial Data Infrastructure and Geoportal: inception and planning, system design and development, data migration for 35 organizations, capacity building, handover and warranty.', source: source, savedAt: '', projectEnd: '2027-11-01' },
+    settings: { holidays: [], autoSched: true },
+    tasks, risks: [], log: [], baseline: { label: 'Workbook V11', savedAt: new Date().toISOString(), map: Object.fromEntries(tasks.map(t => [t.id, [t.start, t.end]])) }, stats: { structuralDepsDropped: dropped }
+  };
+}
+
+function index() {
+  I = { byId: new Map(), byWbs: new Map(), parent: new Map(), kids: new Map(), succ: new Map() };
+  P.tasks.forEach(t => { I.byId.set(t.id, t); if (!I.byWbs.has(t.wbs)) I.byWbs.set(t.wbs, t); I.kids.set(t.id, []); I.succ.set(t.id, []); });
+  P.tasks.forEach(t => {
+    const seg = t.wbs.split('.');
+    for (let k = seg.length - 1; k > 0; k--) { const p = I.byWbs.get(seg.slice(0, k).join('.')); if (p && p !== t) { I.parent.set(t.id, p); I.kids.get(p.id).push(t); break; } }
+    t.deps = t.deps.filter(d => I.byId.has(d.id));
+    t.deps.forEach(d => I.succ.get(d.id).push(t));
+  });
+  P.tasks.forEach(t => { let d = 1, p = I.parent.get(t.id); while (p) { d++; p = I.parent.get(p.id); } t.depth = d; });
+  holidaySet = new Set((P.settings.holidays || []).filter(isISO).map(d2n));
+}
+const isSum = t => I.kids.get(t.id).length > 0;
+const parentOf = t => I.parent.get(t.id);
+function ancestors(t) { const a = []; let p = parentOf(t); while (p) { a.push(p); p = parentOf(p); } return a; }
+function descendants(t, out = []) { I.kids.get(t.id).forEach(k => { out.push(k); descendants(k, out); }); return out; }
+const leaves = () => P.tasks.filter(t => !isSum(t));
+const leavesOf = t => isSum(t) ? descendants(t).filter(x => !isSum(x)) : [t];
+const stageOf = t => { const a = ancestors(t); return a.length ? a[a.length - 1] : t; };
+const stageColor = t => { const n = parseInt(t.wbs, 10); return n >= 1 && n <= 8 ? `var(--s${n})` : 'var(--s9)'; };
+const stColor = s => `var(${ST_META[s] ? ST_META[s][1] : '--st-ns'})`;
+const pill = s => `<span class="pill"><i style="color:${stColor(s)}">${(ST_META[s] || ['○'])[0]}</i>${esc(s)}</span>`;
+
+function rollup() {
+  const w = new Map();
+  [...P.tasks].sort((a, b) => b.depth - a.depth).forEach(t => {
+    const kids = I.kids.get(t.id);
+    if (!kids.length) { w.set(t.id, Math.max(t.dur, 1)); return; }
+    let s = Infinity, e = -Infinity, tw = 0, tp = 0;
+    kids.forEach(k => { s = Math.min(s, d2n(k.start)); e = Math.max(e, d2n(k.end)); const kw = w.get(k.id); tw += kw; tp += kw * k.progress; });
+    t.start = n2d(s); t.end = n2d(e); t.dur = wcount(s, e); t.progress = tw ? Math.round(tp / tw) : 0; w.set(t.id, tw);
+    const st = kids.map(k => k.status);
+    t.status = st.every(x => x === 'Done') ? 'Done' : st.every(x => x === 'Not started') ? 'Not started' : st.every(x => x === 'On hold') ? 'On hold' : st.every(x => x === 'Done' || x === 'Review and QA') ? 'Review and QA' : 'Ongoing';
+  });
+}
+
+/* ---------- scheduling ---------- */
+function setLeafStart(t, n) { n = snap(n); t.start = n2d(n); t.end = n2d(t.dur <= 1 ? n : wshift(n, t.dur - 1)); }
+function requiredStart(t, dep) {
+  const p = I.byId.get(dep.id), ps = d2n(p.start), pe = d2n(p.end), lag = dep.lag || 0;
+  switch (dep.type) {
+    case 'SS': return wshift(ps, lag);
+    case 'FF': case 'SF': {
+      const reqEnd = wshift(dep.type === 'FF' ? pe : ps, lag);
+      return isSum(t) ? d2n(t.start) + (reqEnd - d2n(t.end)) : wshift(reqEnd, -(Math.max(t.dur, 1) - 1));
+    }
+    default: return wshift(pe, 1 + lag);
+  }
+}
+function shiftTask(t, days) {
+  leavesOf(t).forEach(l => setLeafStart(l, d2n(l.start) + days));
+}
+function enforce(t) {
+  if (!t.deps.length) return false;
+  let req = -Infinity;
+  t.deps.forEach(d => { req = Math.max(req, requiredStart(t, d)); });
+  const s = d2n(t.start);
+  if (req <= s) return false;
+  shiftTask(t, req - s);
+  rollup();
+  return true;
+}
+function propagate(seed) {
+  rollup();
+  if (!P.settings.autoSched) return 0;
+  const q = [], moved = new Set();
+  seed.forEach(t => { if (enforce(t)) moved.add(t.id); q.push(t); });
+  let guard = 0;
+  while (q.length && guard++ < 20000) {
+    const t = q.shift();
+    [t, ...ancestors(t)].forEach(a => I.succ.get(a.id).forEach(s => {
+      if (enforce(s)) { moved.add(s.id); q.push(s, ...descendants(s)); }
+    }));
+  }
+  return moved.size;
+}
+function cascade(seed) {
+  const n = propagate(seed);
+  if (n) toast(`${n} dependent task${n > 1 ? 's were' : ' was'} rescheduled. Press Ctrl+Z to undo.`);
+}
+function reach(start) { // tasks whose dates are driven by `start`
+  const seen = new Set(), q = [start, ...descendants(start)];
+  while (q.length) {
+    const x = q.pop(); if (seen.has(x.id)) continue; seen.add(x.id);
+    [x, ...ancestors(x)].forEach(a => I.succ.get(a.id).forEach(s => { if (!seen.has(s.id)) q.push(s, ...descendants(s)); }));
+  }
+  return seen;
+}
+function linkError(p, s) {
+  if (!p || !s) return 'Pick two tasks to link.';
+  if (p === s) return 'A task cannot depend on itself.';
+  if (isAncestorCode(p.wbs, s.wbs) || isAncestorCode(s.wbs, p.wbs)) return `${p.wbs} and ${s.wbs} are parent and child, so they are already linked by the hierarchy.`;
+  if (s.deps.some(d => d.id === p.id)) return `${s.wbs} already depends on ${p.wbs}.`;
+  const r = reach(s);
+  if (r.has(p.id) || descendants(p).some(x => r.has(x.id))) return `That would create a loop: ${p.wbs} already depends on ${s.wbs}.`;
+  return '';
+}
+function depStr(t) {
+  return t.deps.map(d => { const p = I.byId.get(d.id); return p.wbs + (d.type !== 'FS' ? ` (${d.type})` : '') + (d.lag ? (d.lag > 0 ? '+' : '') + d.lag : ''); }).join('; ');
+}
+function drivingChain(target) {
+  const chain = new Set(), links = new Set(), seen = new Set();
+  const latestLeaf = t => leavesOf(t).reduce((a, b) => (b.end > a.end ? b : a));
+  const walk = t => {
+    if (seen.has(t.id)) return; seen.add(t.id); chain.add(t.id);
+    const s = d2n(t.start);
+    [t, ...ancestors(t)].forEach(a => a.deps.forEach(d => {
+      if (d2n(a.start) !== s && a !== t) return;
+      if (requiredStart(a, d) >= s) { const lf = latestLeaf(I.byId.get(d.id)); links.add(d.id + '>' + a.id); chain.add(d.id); chain.add(a.id); walk(lf); }
+    }));
+  };
+  walk(latestLeaf(target));
+  return { chain, links };
+}
+
+/* ---------- persistence ---------- */
+function save() {
+  P.meta.savedAt = new Date().toISOString();
+  try { localStorage.setItem(KEY, JSON.stringify(P)); setSaved('Saved in this browser · ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })); }
+  catch (e) { setSaved('⚠ Could not save in this browser – use File › Save project file'); }
+}
+function setSaved(t) { $('#saveState').textContent = t; }
+function saveUI() { try { localStorage.setItem(UI_KEY, JSON.stringify({ tab: UI.tab, zoom: UI.zoom, colorBy: UI.colorBy, links: UI.links, labels: UI.labels, base: UI.base, welcome: UI.welcome, theme: document.documentElement.dataset.theme || '' })); } catch (e) { /* optional */ } }
+function validProject(p) {
+  return p && Array.isArray(p.tasks) && p.tasks.length && p.tasks.every(t => t && typeof t.id === 'string' && typeof t.wbs === 'string' && isISO(t.start) && isISO(t.end) && Array.isArray(t.deps));
+}
+function adopt(p) {
+  p.meta = Object.assign({ title: 'Project', subtitle: '', headline: '', projectEnd: '' }, p.meta);
+  p.settings = Object.assign({ holidays: [], autoSched: true }, p.settings);
+  p.risks = Array.isArray(p.risks) ? p.risks : []; p.log = Array.isArray(p.log) ? p.log : [];
+  P = p; index(); rollup();
+}
+function load() {
+  try { const raw = localStorage.getItem(KEY); if (raw) { const p = JSON.parse(raw); if (validProject(p)) { adopt(p); return true; } } } catch (e) { /* fall through to seed */ }
+  adopt(buildFromRows(window.SEED_ROWS, window.SEED_SOURCE));
+  return false;
+}
+function logIt(label) { P.log.unshift({ at: new Date().toISOString(), what: label }); P.log.length = Math.min(P.log.length, 200); }
+function commit(label, fn) {
+  const snapShot = JSON.stringify({ tasks: P.tasks, risks: P.risks, meta: P.meta, settings: P.settings, baseline: P.baseline });
+  if (fn() === false) { Object.assign(P, JSON.parse(snapShot)); index(); rollup(); renderAll(); return false; }
+  undoStack.push(snapShot); if (undoStack.length > 40) undoStack.shift(); redoStack = [];
+  logIt(label); index(); rollup(); save(); renderAll();
+  return true;
+}
+function restore(from, to, name) {
+  if (!from.length) return toast('Nothing to ' + name);
+  to.push(JSON.stringify({ tasks: P.tasks, risks: P.risks, meta: P.meta, settings: P.settings, baseline: P.baseline }));
+  Object.assign(P, JSON.parse(from.pop())); index(); rollup(); save(); renderAll();
+  toast(name === 'undo' ? 'Undone' : 'Redone');
+}
+
+/* ---------- editing ---------- */
+function setField(t, f, v) {
+  const sum = isSum(t);
+  switch (f) {
+    case 'name': if (!String(v).trim()) { toast('A task needs a name', 1); return false; } t.name = String(v).trim(); break;
+    case 'wbs': {
+      v = String(v).trim();
+      if (!/^\d+(\.\d+)*$/.test(v)) { toast('WBS codes look like 2.1.3', 1); return false; }
+      if (I.byWbs.has(v) && I.byWbs.get(v) !== t) { toast(`WBS ${v} is already in use`, 1); return false; }
+      if (sum) { toast('Renumber a parent by editing its sub-tasks first', 1); return false; }
+      t.wbs = v; t.dup = false; index(); break;
+    }
+    case 'start': if (sum || !isISO(v)) return false; setLeafStart(t, d2n(v)); cascade([t]); break;
+    case 'end': {
+      if (sum || !isISO(v) || v < t.start) { if (v < t.start) toast('End date cannot be before the start', 1); return false; }
+      const e = d2n(v); t.dur = wcount(d2n(t.start), e) || 1; t.end = n2d(snap(e)); cascade([t]); break;
+    }
+    case 'dur': { const n = Math.round(+v); if (sum || !(n >= 0)) return false; t.dur = n; setLeafStart(t, d2n(t.start)); cascade([t]); break; }
+    case 'status':
+      if (sum || !STATUSES.includes(v)) return false;
+      t.status = v;
+      if (v === 'Done') t.progress = 100;
+      else if (v === 'Not started') t.progress = 0;
+      else if (ST_META[v][2] != null && (t.progress === 0 || t.progress === 100)) t.progress = ST_META[v][2];
+      break;
+    case 'progress': {
+      const n = Math.round(+v); if (sum || isNaN(n)) return false; t.progress = clamp(n, 0, 100);
+      if (t.progress === 100) t.status = 'Done'; else if (t.status === 'Done') t.status = 'Ongoing'; else if (t.progress > 0 && t.status === 'Not started') t.status = 'Ongoing';
+      break;
+    }
+    case 'deps': {
+      const { deps, notes } = parseDepString(v);
+      if (notes.length) { toast('Use the format: 1.2; 1.3 (SS); 1.4 (FF)+2', 1); return false; }
+      const keep = t.deps; t.deps = [];  index();
+      for (const d of deps) {
+        const p = I.byWbs.get(d.code); const err = linkError(p, t);
+        if (err) { t.deps = keep; index(); toast(p ? err : `No task with WBS ${d.code}`, 1); return false; }
+        t.deps.push({ id: p.id, type: d.type, lag: d.lag }); index();
+      }
+      propagate([t]); break;
+    }
+    default: t[f] = v;
+  }
+  return true;
+}
+function nextWbs(parent) {
+  const sibs = parent ? I.kids.get(parent.id) : P.tasks.filter(t => !parentOf(t));
+  const max = sibs.reduce((m, s) => Math.max(m, +s.wbs.split('.').pop() || 0), 0);
+  return (parent ? parent.wbs + '.' : '') + (max + 1);
+}
+function addTask(parent, o = {}) {
+  const id = 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const start = isISO(o.start) ? o.start : parent ? parent.start : n2d(snap(todayN()));
+  const dur = o.dur != null ? o.dur : 5;
+  const t = { id, wbs: nextWbs(parent), name: o.name || 'New task', category: o.category || (o.ms ? 'Milestone' : 'Task'), scope: '', owner: parent ? parent.owner : '', role: '', other: '', note: '', status: 'Not started', srcStatus: '', progress: 0, dur, start, end: start, deps: [], depNote: '', depRaw: '', sow: '', qa: '', ms: !!o.ms, notes: '' };
+  setLeafStartRaw(t);
+  let at = P.tasks.length;
+  if (parent) { const d = descendants(parent); const last = d.length ? d.reduce((a, b) => (P.tasks.indexOf(b) > P.tasks.indexOf(a) ? b : a)) : parent; at = P.tasks.indexOf(last) + 1; }
+  P.tasks.splice(at, 0, t);
+  if (parent) collapsed.delete(parent.id);
+  index();
+  return t;
+}
+function setLeafStartRaw(t) { const n = snap(d2n(t.start)); t.start = n2d(n); t.end = n2d(t.dur <= 1 ? n : wshift(n, t.dur - 1)); }
+function removeTask(t) {
+  const gone = new Set([t.id, ...descendants(t).map(x => x.id)]);
+  P.tasks = P.tasks.filter(x => !gone.has(x.id));
+  P.tasks.forEach(x => { x.deps = x.deps.filter(d => !gone.has(d.id)); });
+  if (gone.has(UI.sel)) UI.sel = null;
+  index();
+}
+
+/* ---------- filtering ---------- */
+const filterActive = () => !!(F.q || F.stage || F.owner || F.status || F.cat);
+function match(t) {
+  if (F.stage && stageOf(t).wbs !== F.stage) return false;
+  if (F.owner && t.owner !== F.owner) return false;
+  if (F.status && t.status !== F.status) return false;
+  if (F.cat && t.category !== F.cat) return false;
+  if (F.q) { const q = F.q.toLowerCase(); if (!(`${t.wbs} ${t.name} ${t.scope} ${t.role} ${t.owner} ${t.other}`.toLowerCase().includes(q))) return false; }
+  return true;
+}
+function visibleRows() {
+  const active = filterActive(); let keep = null;
+  if (active) { keep = new Set(); P.tasks.forEach(t => { if (match(t)) { let c = t; while (c && !keep.has(c.id)) { keep.add(c.id); c = parentOf(c); } } }); }
+  return P.tasks.filter(t => {
+    if (keep) return keep.has(t.id);
+    let p = parentOf(t);
+    while (p) { if (collapsed.has(p.id)) return false; p = parentOf(p); }
+    return true;
+  });
+}
+function setLevel(n) { UI.level = n; collapsed.clear(); P.tasks.forEach(t => { if (isSum(t) && t.depth >= n) collapsed.add(t.id); }); }
+function uniq(arr) { return [...new Set(arr.filter(Boolean))].sort(); }
+function opt(v, sel, label) { return `<option value="${esc(v)}"${v === sel ? ' selected' : ''}>${esc(label == null ? v : label)}</option>`; }
+function filterBar(extra = '', withLevel = true) {
+  const stages = P.tasks.filter(t => !parentOf(t));
+  return `<input type="search" placeholder="🔍 Search tasks…" value="${esc(F.q)}" data-filter="q" aria-label="Search tasks">
+  <select data-filter="stage" aria-label="Stage">${opt('', F.stage, 'All stages')}${stages.map(s => opt(s.wbs, F.stage, `${s.wbs}. ${s.name}`)).join('')}</select>
+  <select data-filter="owner" aria-label="Task owner">${opt('', F.owner, 'All owners')}${uniq(P.tasks.map(t => t.owner)).map(o => opt(o, F.owner)).join('')}</select>
+  <select data-filter="status" aria-label="Status">${opt('', F.status, 'All statuses')}${STATUSES.map(o => opt(o, F.status)).join('')}</select>
+  <select data-filter="cat" aria-label="Category">${opt('', F.cat, 'All categories')}${uniq(P.tasks.map(t => t.category)).map(o => opt(o, F.cat)).join('')}</select>
+  ${filterActive() ? '<button class="btn sm" data-act="clearFilters">✕ Clear</button>' : ''}
+  ${withLevel ? `<label>Show levels <select data-act-change="level">${[1, 2, 3, 4, 5, 6].map(n => opt(String(n), String(UI.level), 'L' + n + (n === 6 ? ' (all)' : ''))).join('')}</select></label>` : ''}${extra}`;
+}
+
+/* ---------- plan numbers ---------- */
+function planStats() {
+  const ls = leaves(), T = todayN();
+  const tw = ls.reduce((a, t) => a + Math.max(t.dur, 1), 0);
+  const prog = tw ? Math.round(ls.reduce((a, t) => a + Math.max(t.dur, 1) * t.progress, 0) / tw) : 0;
+  const overdue = ls.filter(t => t.status !== 'Done' && d2n(t.end) < T);
+  const late = ls.filter(t => t.status === 'Not started' && d2n(t.start) < T && d2n(t.end) >= T);
+  const next30 = ls.filter(t => t.status !== 'Done' && d2n(t.end) >= T && d2n(t.end) <= T + 30);
+  const counts = Object.fromEntries(STATUSES.map(s => [s, ls.filter(t => t.status === s).length]));
+  const ms = P.tasks.filter(t => t.ms);
+  const nextMs = ms.filter(t => t.status !== 'Done' && d2n(t.end) >= T).sort((a, b) => a.end.localeCompare(b.end));
+  return { ls, prog, overdue, late, next30, counts, ms, nextMs, finish: P.tasks.reduce((m, t) => t.end > m ? t.end : m, ''), start: P.tasks.reduce((m, t) => !m || t.start < m ? t.start : m, '') };
+}
+
+/* ---------- views ---------- */
+function statusStack(ts) {
+  const n = ts.length || 1;
+  return `<div class="stack" role="img" aria-label="${STATUSES.map(s => `${s}: ${ts.filter(t => t.status === s).length}`).join(', ')}">` + STATUSES.map(s => {
+    const c = ts.filter(t => t.status === s).length;
+    return c ? `<i style="flex:${c / n};background:${stColor(s)}" data-tip="${esc(s)}: ${c} task${c === 1 ? '' : 's'}"></i>` : '';
+  }).join('') + '</div>';
+}
+const statusLegend = () => `<div class="legend">${STATUSES.map(s => `<span><i style="background:${stColor(s)}"></i>${ST_META[s][0]} ${s}</span>`).join('')}</div>`;
+
+function viewSummary() {
+  const S = planStats(), stages = P.tasks.filter(t => !parentOf(t)), T = todayN();
+  const cats = uniq(S.ls.map(t => t.category || '(No category)'));
+  const catRows = cats.map(c => { const ts = S.ls.filter(t => (t.category || '(No category)') === c); const w = ts.reduce((a, t) => a + Math.max(t.dur, 1), 0); return { c, ts, p: w ? Math.round(ts.reduce((a, t) => a + Math.max(t.dur, 1) * t.progress, 0) / w) : 0, next: ts.filter(t => t.status !== 'Done').map(t => t.end).filter(e => d2n(e) >= T).sort()[0] }; }).sort((a, b) => b.ts.length - a.ts.length);
+  const owners = uniq(S.ls.map(t => t.owner || '(Unassigned)')).map(o => ({ o, ts: S.ls.filter(t => (t.owner || '(Unassigned)') === o) })).sort((a, b) => b.ts.length - a.ts.length);
+  const beyond = P.meta.projectEnd ? stages.filter(s => s.end > P.meta.projectEnd).length : 0;
+  const welcome = UI.welcome ? `<div class="card" style="margin-bottom:12px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap"><div>👋 <b>Welcome!</b> Everything here is editable and saves automatically in your browser. Click any task to open its details, or head to the <a href="#" data-act="goto" data-tab="gantt">Gantt</a> to drag bars and draw dependencies.</div><div><button class="btn sm" data-act="help">Quick guide</button> <button class="btn sm" data-act="dismissWelcome">Got it</button></div></div>` : '';
+  return `${welcome}<section class="card hero">
+    <h1 contenteditable="true" spellcheck="false" data-meta="title" aria-label="Project title">${esc(P.meta.title)}</h1>
+    <div class="ink2" contenteditable="true" data-meta="subtitle" aria-label="Subtitle">${esc(P.meta.subtitle)}</div>
+    <p contenteditable="true" data-meta="headline" aria-label="Project headline">${esc(P.meta.headline)}</p>
+  </section>
+  <section class="grid kpis mt">
+    <div class="card kpi"><small>Overall progress</small><b>${S.prog}%</b><div class="progress"><i style="width:${S.prog}%;background:var(--pri)"></i></div><span>Weighted by task duration</span></div>
+    <div class="card kpi"><small>Tasks completed</small><b>${S.counts['Done']} / ${S.ls.length}</b><span>${S.counts['Ongoing'] + S.counts['Review and QA']} in progress</span></div>
+    <div class="card kpi link" data-act="goto" data-tab="health"><small>⚠ Overdue</small><b>${S.overdue.length}</b><span>${S.late.length} more should have started</span></div>
+    <div class="card kpi"><small>Due in next 30 days</small><b>${S.next30.length}</b><span>Tasks finishing by ${fmtS(n2d(T + 30))}</span></div>
+    <div class="card kpi link" data-act="goto" data-tab="milestones"><small>◆ Next milestone</small><b style="font-size:17px">${S.nextMs[0] ? fmt(S.nextMs[0].end) : 'None'}</b><span>${S.nextMs[0] ? esc(S.nextMs[0].name.slice(0, 52)) : 'No upcoming milestones'}</span></div>
+    <div class="card kpi"><small>Plan runs</small><b style="font-size:17px">${fmtS(S.start)} → ${fmtS(S.finish)}</b><span>${beyond ? `${beyond} stage${beyond > 1 ? 's' : ''} past the ${fmtS(P.meta.projectEnd)} project end` : 'Within project end date'}</span></div>
+  </section>
+  <section class="card mt"><h3>Timeline by stage</h3>${stageTimeline(stages, S)}</section>
+  <h3 style="margin:16px 0 8px;font-size:15px">Main tasks by stage</h3>
+  <section class="grid stages">${stages.map(s => stageCard(s)).join('')}</section>
+  <div class="mt">${statusLegend()}</div>
+  <section class="grid two mt">
+    <div class="card"><h3>Task categories</h3>
+      <table><thead><tr><th>Category</th><th>Tasks</th><th style="width:34%">Progress</th><th>Next due</th></tr></thead><tbody>
+      ${catRows.map(r => `<tr><td>${esc(r.c)}</td><td>${r.ts.length}</td><td><div class="progress" data-tip="${r.p}% complete"><i style="width:${r.p}%;background:var(--pri)"></i></div></td><td class="nowrap">${fmtS(r.next)}</td></tr>`).join('')}
+      </tbody></table></div>
+    <div class="card"><h3>Who's doing what</h3>
+      ${owners.map(o => `<div class="meta"><span>${esc(o.o)}</span><span>${o.ts.length} tasks</span></div>${statusStack(o.ts)}`).join('')}
+    </div>
+    <div class="card"><h3>◆ Coming up</h3>${S.nextMs.slice(0, 7).map(t => miniRow(t, fmtS(t.end))).join('') || '<div class="muted">No upcoming milestones.</div>'}</div>
+    <div class="card"><h3>⚠ Needs attention</h3>${[...S.overdue].sort((a, b) => a.end.localeCompare(b.end)).slice(0, 7).map(t => miniRow(t, fmtS(t.end))).join('') || '<div class="muted">Nothing overdue. Nice work! 🎉</div>'}</div>
+  </section>`;
+}
+const miniRow = (t, right) => `<div class="mini-row" data-open="${t.id}"><span><span class="muted">${esc(t.wbs)}</span> ${esc(t.name)}</span><span class="nowrap ink2">${right}</span></div>`;
+function stageCard(s) {
+  const ls = leavesOf(s), subs = I.kids.get(s.id);
+  const qa = s.qa ? s.qa.split(/;|\n/).map(x => x.trim()).filter(Boolean).slice(0, 8) : [];
+  return `<article class="card stage">
+    <div class="stage-head"><span class="dot" style="background:${stageColor(s)}"></span><div><h4><a href="#" data-open="${s.id}" style="color:inherit;text-decoration:none">${esc(s.wbs)}. ${esc(s.name)}</a></h4></div></div>
+    <p>${esc(s.scope)}</p>
+    <div class="meta"><span>${fmtS(s.start)} → ${fmtS(s.end)}</span><b>${s.progress}%</b></div>
+    <div class="progress"><i style="width:${s.progress}%;background:${stageColor(s)}"></i></div>
+    ${statusStack(ls)}
+    <div class="meta"><span>${ls.length} tasks · ${pill(s.status)}</span><a href="#" data-act="focusStage" data-wbs="${esc(s.wbs)}">View in Gantt →</a></div>
+    ${subs.length ? `<details><summary>${subs.length} sub-phases</summary>${subs.map(k => `<div class="sub-row"><span class="muted">${esc(k.wbs)}</span><a href="#" data-open="${k.id}" style="color:inherit;text-decoration:none">${esc(k.name)}</a><span>${k.progress}%</span></div>`).join('')}</details>` : ''}
+    ${qa.length ? `<details><summary>Main QA / consultancy tasks</summary><ul class="qa-list">${qa.map(q => `<li>${esc(q)}</li>`).join('')}</ul></details>` : ''}
+  </article>`;
+}
+function stageTimeline(stages, S) {
+  if (!stages.length) return '';
+  const W = 1000, L = 250, rh = 24, H = stages.length * rh + 22, r0 = d2n(S.start), r1 = d2n(S.finish), x = n => L + (n - r0) / Math.max(1, r1 - r0) * (W - L - 12);
+  const y0 = +S.start.slice(0, 4), y1 = +S.finish.slice(0, 4); let g = '';
+  for (let y = y0; y <= y1; y++) { const n = Math.floor(Date.UTC(y, 0, 1) / 864e5); if (n >= r0) g += `<line x1="${x(n)}" x2="${x(n)}" y1="0" y2="${H - 18}" stroke="var(--line)"/>`; g += `<text x="${Math.max(x(n), L) + 3}" y="${H - 5}">${y}</text>`; }
+  const T = todayN(); const tl = T >= r0 && T <= r1 ? `<line x1="${x(T)}" x2="${x(T)}" y1="0" y2="${H - 18}" stroke="var(--today)" stroke-width="1.5" stroke-dasharray="4 3"/>` : '';
+  const bars = stages.map((s, i) => {
+    const a = x(d2n(s.start)), b = Math.max(x(d2n(s.end) + 1), a + 4), y = i * rh + 4;
+    return `<text x="0" y="${y + 12}">${esc(s.wbs)}. ${esc(s.name.length > 38 ? s.name.slice(0, 37) + '…' : s.name)}</text>
+    <g data-open="${s.id}" style="cursor:pointer" data-tip="${esc(s.wbs + '. ' + s.name)}\n${fmt(s.start)} → ${fmt(s.end)}\n${s.progress}% complete"><rect x="${a}" y="${y - 3}" width="${b - a}" height="22" fill="transparent"/><rect x="${a}" y="${y + 2}" width="${b - a}" height="12" rx="4" fill="${stageColor(s)}" fill-opacity=".3"/><rect x="${a}" y="${y + 2}" width="${(b - a) * s.progress / 100}" height="12" rx="4" fill="${stageColor(s)}"/></g>`;
+  }).join('');
+  return `<svg class="tl-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Stage timeline">${g}${bars}${tl}</svg><div class="legend"><span><i style="background:var(--today)"></i>Today (${fmtS(n2d(T))})</span><span class="muted">Solid part of each bar = progress</span></div>`;
+}
+
+function viewWbs() {
+  const rows = visibleRows(), T = todayN();
+  return `<div class="bar-tools">${filterBar()}<span class="grow"></span>
+    <button class="btn" data-act="expandAll">Expand</button><button class="btn" data-act="collapseAll">Collapse</button>
+    <button class="btn pri" data-act="addStage">＋ Stage</button></div>
+  <div class="scroll" data-scroll="wbs"><table><thead><tr><th>Task</th><th>Category</th><th>Task owner</th><th>Assigned role</th><th>Other participant</th><th>Status</th><th>%</th><th>Days</th><th>Start</th><th>End</th><th>Predecessors</th><th>SOW</th><th></th></tr></thead><tbody>
+  ${rows.map(t => {
+    const sum = isSum(t), lock = sum ? 'locked' : '', late = t.status !== 'Done' && d2n(t.end) < T;
+    return `<tr class="${sum ? 'sum' : ''} d${t.depth}" data-row="${t.id}">
+    <td><div class="tname" style="padding-left:${(t.depth - 1) * 14}px"><button class="caret ${sum ? '' : 'none'}" data-act="toggle" data-id="${t.id}" aria-label="Expand or collapse">${collapsed.has(t.id) && !filterActive() ? '▶' : '▼'}</button><span class="muted nowrap" style="font-size:12px;font-weight:400">${esc(t.wbs)}</span>${t.ms ? '<span class="ms" data-tip="Milestone">◆</span>' : ''}<span class="txt" data-open="${t.id}" data-tip="${esc(t.name)}">${esc(t.name)}</span></div></td>
+    <td data-e="category" class="nowrap">${esc(t.category)}</td><td data-e="owner" class="nowrap">${esc(t.owner)}</td><td data-e="role" class="nowrap">${esc(t.role)}</td><td data-e="other" class="nowrap">${esc(t.other)}</td>
+    <td ${sum ? 'class="locked"' : 'data-e="status"'}>${pill(t.status)}</td>
+    <td ${sum ? 'class="locked"' : 'data-e="progress"'}>${t.progress}</td>
+    <td ${sum ? 'class="locked"' : 'data-e="dur"'}>${t.dur}</td>
+    <td ${sum ? 'class="locked nowrap"' : 'data-e="start" class="nowrap"'}>${fmtS(t.start)}</td>
+    <td ${sum ? `class="locked nowrap ${late ? 'late' : ''}"` : `data-e="end" class="nowrap ${late ? 'late' : ''}"`}>${fmtS(t.end)}</td>
+    <td data-e="deps" class="nowrap" data-tip="${esc(t.depNote || '')}">${esc(depStr(t))}</td><td class="nowrap muted">${esc(t.sow)}</td>
+    <td><div class="row-act"><button data-act="addChild" data-id="${t.id}" data-tip="Add sub-task" aria-label="Add sub-task">＋</button><button data-act="addMsUnder" data-id="${t.id}" data-tip="Add milestone" aria-label="Add milestone">◆</button><button data-act="delTask" data-id="${t.id}" data-tip="Delete" aria-label="Delete">🗑</button></div></td></tr>`;
+  }).join('') || `<tr><td colspan="13"><div class="empty"><div class="big">🔍</div>No tasks match these filters.</div></td></tr>`}
+  </tbody></table></div>`;
+}
+function startCellEdit(td) {
+  const id = td.closest('[data-row]').dataset.row, t = I.byId.get(id), f = td.dataset.e;
+  if (td.querySelector('input,select')) return;
+  let ed;
+  if (f === 'status') ed = `<select>${STATUSES.map(s => opt(s, t.status)).join('')}</select>`;
+  else if (f === 'start' || f === 'end') ed = `<input type="date" value="${t[f]}">`;
+  else if (f === 'dur' || f === 'progress') ed = `<input type="number" min="0" ${f === 'progress' ? 'max="100"' : ''} value="${t[f]}" style="width:60px">`;
+  else if (f === 'deps') ed = `<input value="${esc(depStr(t))}" placeholder="1.2; 1.3 (SS)+2" style="width:150px">`;
+  else ed = `<input value="${esc(t[f])}" style="min-width:120px">`;
+  td.innerHTML = ed;
+  const el = td.firstElementChild; el.focus(); if (el.select) el.select();
+  let done = false;
+  const finish = ok => {
+    if (done) return; done = true;
+    const v = el.value;
+    if (ok && String(v) !== String(f === 'deps' ? depStr(t) : t[f])) {
+      if (!commit(`Changed ${f} of ${t.wbs}`, () => setField(t, f, v))) renderView();
+    } else renderView();
+  };
+  el.addEventListener('blur', () => finish(true));
+  el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); finish(true); } if (e.key === 'Escape') finish(false); });
+  if (el.tagName === 'SELECT') el.addEventListener('change', () => finish(true));
+}
+
+/* ---------- gantt ---------- */
+function monthsBetween(r0, r1) {
+  const out = []; let d = new Date(r0 * 864e5); d = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+  while (d.getTime() / 864e5 <= r1) { out.push({ n: d.getTime() / 864e5, y: d.getUTCFullYear(), m: d.getUTCMonth() }); d = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)); }
+  return out;
+}
+let G = null;
+function viewGantt() {
+  return `<div class="bar-tools">${filterBar()}</div>
+  <div class="bar-tools">
+    <span style="display:inline-flex;gap:3px" role="group" aria-label="Zoom">${[...Object.keys(ZOOMS), 'Fit'].map(z => `<button class="btn sm ${UI.zoom === z ? 'on' : ''}" data-act="zoom" data-z="${z}">${z}</button>`).join('')}</span>
+    <button class="btn sm" data-act="scrollToday">📍 Today</button>
+    <label>Colour <select data-act-change="colorBy">${[['stage', 'Stage'], ['status', 'Status'], ['owner', 'Owner']].map(([v, l]) => opt(v, UI.colorBy, l)).join('')}</select></label>
+    <button class="btn sm ${UI.links ? 'on' : ''}" data-act="flag" data-k="links">🔗 Links</button>
+    <button class="btn sm ${UI.labels ? 'on' : ''}" data-act="flag" data-k="labels">🏷 Labels</button>
+    <button class="btn sm ${UI.base ? 'on' : ''}" data-act="flag" data-k="base" data-tip="Grey line under each bar = saved baseline">📐 Baseline</button>
+    <button class="btn sm ${UI.crit ? 'on' : ''}" data-act="flag" data-k="crit" data-tip="Chain of tasks driving the finish of the selected task (or stage 7 if none is selected)">🔥 Critical path</button>
+    <span class="grow"></span>
+    <button class="btn sm" data-act="manageLinks">🔗 Manage dependencies</button>
+    <button class="btn sm" data-act="addMilestone">◆ Add milestone</button>
+    <button class="btn sm pri" data-act="addTaskDlg">＋ Task</button>
+  </div>
+  <div class="g-wrap" id="gWrap" data-scroll="gantt"><div class="g-in" id="gIn"></div></div>
+  <div class="legend mt"><span>Drag a bar to move it · drag its right edge to resize · drag the ○ at its end onto another bar to link them · click a link to edit it</span>
+    <span><i style="background:var(--today)"></i>Today</span><span><i style="background:var(--warn)"></i>Project end</span><span style="color:var(--ink2)">◆ Milestone</span></div>`;
+}
+function barColor(t) {
+  if (UI.colorBy === 'status') return stColor(t.status);
+  if (UI.colorBy === 'owner') { const o = G.owners.indexOf(t.owner); return o >= 0 && o < 8 ? `var(--s${o + 1})` : 'var(--s9)'; }
+  return stageColor(t);
+}
+function renderGantt() {
+  const wrap = $('#gWrap'); if (!wrap) return;
+  const rows = visibleRows();
+  const src = rows.length ? rows : P.tasks;
+  const min = src.reduce((m, t) => Math.min(m, d2n(t.start)), Infinity), max = src.reduce((m, t) => Math.max(m, d2n(t.end)), -Infinity);
+  const leftW = window.innerWidth <= 720 ? 210 : 370;
+  let ppd, r0, r1;
+  if (UI.zoom === 'Fit') { r0 = min - 3; r1 = max + 6; ppd = Math.max(0.15, (wrap.clientWidth - leftW - 24) / (r1 - r0)); }
+  else { ppd = ZOOMS[UI.zoom]; r0 = min - Math.ceil(40 / ppd); r1 = max + Math.ceil((UI.labels ? 320 : 60) / ppd); }
+  const W = Math.ceil((r1 - r0) * ppd), rh = 30, H = Math.max(rows.length * rh, 60), x = n => (n - r0) * ppd;
+  G = { rows, ppd, r0, x, rh, owners: uniq(P.tasks.map(t => t.owner)), rowIdx: new Map(rows.map((t, i) => [t.id, i])) };
+  const T = todayN(), selT = UI.sel && I.byId.get(UI.sel);
+
+  // header
+  let h = '', top = '', grid = '';
+  const months = monthsBetween(r0, r1);
+  const unit = ppd >= 15 ? 'day' : ppd >= 5 ? 'week' : ppd >= 1.5 ? 'month' : 'quarter';
+  if (unit === 'day' || unit === 'week') {
+    months.forEach(m => { top += `<text class="top-t" x="${Math.max(x(m.n), 0) + 4}" y="17">${MONTHS[m.m]} ${m.y}</text><line x1="${x(m.n)}" x2="${x(m.n)}" y1="0" y2="46"/>`; grid += `<line class="gl" x1="${x(m.n)}" x2="${x(m.n)}" y1="0" y2="${H}"/>`; });
+    for (let n = r0; n <= r1; n++) {
+      if (unit === 'day') h += `<text x="${x(n) + 5}" y="38" style="font-size:10px">${new Date(n * 864e5).getUTCDate()}</text>`;
+      else if (dow(n) === 1) h += `<text x="${x(n) + 2}" y="38" style="font-size:10px">${new Date(n * 864e5).getUTCDate()}</text>`;
+      if (!isWork(n)) grid += `<rect class="we" x="${x(n)}" y="0" width="${ppd}" height="${H}"/>`;
+    }
+  } else {
+    const years = new Map(); months.forEach(m => { if (!years.has(m.y)) years.set(m.y, m.n); });
+    years.forEach((n, y) => { top += `<text class="top-t" x="${Math.max(x(n), 0) + 4}" y="17">${y}</text><line x1="${x(n)}" x2="${x(n)}" y1="0" y2="46"/>`; grid += `<line class="gl" x1="${x(n)}" x2="${x(n)}" y1="0" y2="${H}" style="opacity:1"/>`; });
+    months.forEach(m => {
+      if (unit === 'month') { h += `<text x="${x(m.n) + 3}" y="38" style="font-size:10px">${MONTHS[m.m]}</text>`; grid += `<line class="gl" x1="${x(m.n)}" x2="${x(m.n)}" y1="0" y2="${H}"/>`; }
+      else if (m.m % 3 === 0) { h += `<text x="${x(m.n) + 3}" y="38" style="font-size:10px">Q${m.m / 3 + 1}</text>`; grid += `<line class="gl" x1="${x(m.n)}" x2="${x(m.n)}" y1="0" y2="${H}"/>`; }
+    });
+  }
+
+  // critical chain
+  let cc = null;
+  if (UI.crit) { const tgt = selT || I.byWbs.get('7') || P.tasks[P.tasks.length - 1]; cc = drivingChain(tgt); }
+
+  // arrows
+  let arrows = '';
+  if (UI.links) {
+    const vis = t => { let c = t; while (c && !G.rowIdx.has(c.id)) c = parentOf(c); return c; };
+    const seen = new Set();
+    P.tasks.forEach(s => s.deps.forEach(d => {
+      const p = I.byId.get(d.id), a = vis(p), b = vis(s);
+      if (!a || !b || a === b || isAncestorCode(a.wbs, b.wbs) || isAncestorCode(b.wbs, a.wbs)) return;
+      const agg = a !== p || b !== s, key = a.id + '>' + b.id;
+      if (agg && seen.has(key)) return; seen.add(key);
+      const startSide = d.type === 'SS' || d.type === 'SF', endSide = d.type === 'FF' || d.type === 'SF';
+      const y1 = G.rowIdx.get(a.id) * rh + rh / 2, y2 = G.rowIdx.get(b.id) * rh + rh / 2;
+      const x1 = startSide ? x(d2n(a.start)) : x(d2n(a.end) + 1), x2 = endSide ? x(d2n(b.end) + 1) : x(d2n(b.start));
+      const out = startSide ? -8 : 8, inn = endSide ? 8 : -8, ym = y1 + (y2 > y1 ? rh / 2 : -rh / 2);
+      let path;
+      if (!startSide && !endSide && x2 - x1 >= 16) path = `M${x1} ${y1}H${(x1 + 8)}V${y2}H${x2 - 1}`;
+      else path = `M${x1} ${y1}H${x1 + out}V${ym}H${x2 + inn}V${y2}H${x2 + (endSide ? 1 : -1)}`;
+      const crit = cc && cc.links.has(d.id + '>' + s.id);
+      arrows += `<path class="arw-hit" d="${path}" data-dep="${s.id}|${d.id}" data-tip="${esc(p.wbs + ' → ' + s.wbs)} · ${DEP_LABEL[d.type]}${d.lag ? ' · lag ' + d.lag + 'd' : ''}${agg ? '\n(rolled up – expand rows to see the exact link)' : ''}\nClick to edit"/><path class="arw ${crit ? 'c' : ''} ${agg ? 'agg' : ''}" d="${path}" marker-end="url(#${crit ? 'arrowCrit' : 'arrowHead'})"/>`;
+    }));
+  }
+
+  // bars
+  const base = P.baseline && P.baseline.map;
+  const barsHtml = rows.map((t, i) => {
+    const y = i * rh, a = x(d2n(t.start)), b = Math.max(x(d2n(t.end) + 1), a + 3), w = b - a, col = barColor(t), sum = isSum(t), cy = y + rh / 2;
+    const tip = `${t.wbs} ${t.name}\n${fmt(t.start)} → ${fmt(t.end)} (${t.dur} workdays)\n${t.status} · ${t.progress}%${t.owner ? '\n' + t.owner : ''}`;
+    const inCrit = cc && cc.chain.has(t.id);
+    let s = `<g class="bar" data-id="${t.id}" data-tip="${esc(tip)}">`;
+    if (UI.base && base && base[t.id]) { const bx = x(d2n(base[t.id][0])), be = x(d2n(base[t.id][1]) + 1); s += `<rect class="base" x="${bx}" y="${y + rh - 7}" width="${Math.max(be - bx, 2)}" height="3" rx="1.5"/>`; }
+    const milestoneOnly = t.ms && t.dur === 0 && !sum;
+    if (milestoneOnly) { /* diamond only */ }
+    else if (sum) {
+      s += `<rect data-h="move" x="${a}" y="${cy - 5}" width="${w}" height="10" fill="transparent"/><rect data-h="move" x="${a}" y="${cy - 3}" width="${w}" height="6" rx="3" fill="${col}"/><rect data-h="move" x="${a}" y="${cy - 3}" width="${Math.max(w * t.progress / 100, 0)}" height="6" rx="3" fill="var(--ink)" fill-opacity=".45"/>`;
+    } else {
+      s += `<rect class="tr" data-h="move" x="${a}" y="${cy - 8}" width="${w}" height="16" rx="4" fill="${col}"/>` + (t.progress ? `<rect data-h="move" x="${a}" y="${cy - 8}" width="${w * t.progress / 100}" height="16" rx="4" fill="${col}"/>` : '') + `<rect class="rz" data-h="resize" x="${b - 5}" y="${cy - 8}" width="8" height="16"/>`;
+    }
+    if (inCrit && !milestoneOnly) s += `<rect class="crit" x="${a - 1.5}" y="${cy - (sum ? 5 : 10)}" width="${w + 3}" height="${sum ? 10 : 20}" rx="5"/>`;
+    let right = b;
+    if (t.ms) { const mx = x(d2n(t.end)) + ppd / 2 + (milestoneOnly ? 0 : ppd / 2); s += `<path class="dia" data-h="${sum ? 'none' : 'move'}" d="M${mx} ${cy - 8}L${mx + 8} ${cy}L${mx} ${cy + 8}L${mx - 8} ${cy}Z" fill="${t.status === 'Done' ? 'var(--st-dn)' : inCrit ? 'var(--crit)' : 'var(--s4)'}"/>`; right = Math.max(b, mx + 8); }
+    s += `<rect x="${right}" y="${cy - 8}" width="16" height="16" fill="transparent" data-h="none"/><circle class="lnk" data-h="link" cx="${right + 9}" cy="${cy}" r="5"/>`;
+    if (UI.labels) s += `<text class="lbl" x="${right + 18}" y="${cy + 4}">${esc(t.name.length > 46 ? t.name.slice(0, 45) + '…' : t.name)}</text>`;
+    return s + '</g>';
+  }).join('');
+  const rowLines = rows.map((t, i) => (t.id === UI.sel ? `<rect class="selb" x="0" y="${i * rh}" width="${W}" height="${rh}"/>` : '') + `<line class="rl" x1="0" x2="${W}" y1="${(i + 1) * rh - .5}" y2="${(i + 1) * rh - .5}"/>`).join('');
+  const peLine = P.meta.projectEnd && d2n(P.meta.projectEnd) >= r0 && d2n(P.meta.projectEnd) <= r1 ? `<line class="pe" x1="${x(d2n(P.meta.projectEnd))}" x2="${x(d2n(P.meta.projectEnd))}" y1="0" y2="${H}"/>` : '';
+  const todayLine = T >= r0 && T <= r1 ? `<line class="today" x1="${x(T) + ppd / 2}" x2="${x(T) + ppd / 2}" y1="0" y2="${H}"/>` : '';
+
+  const left = rows.map(t => `<div class="g-row ${isSum(t) ? 'sum' : ''} ${t.id === UI.sel ? 'sel' : ''}" style="padding-left:${(t.depth - 1) * 11 + 4}px">
+    <button class="caret ${isSum(t) ? '' : 'none'}" data-act="toggle" data-id="${t.id}" aria-label="Expand or collapse">${collapsed.has(t.id) && !filterActive() ? '▶' : '▼'}</button><code>${esc(t.wbs)}</code>${t.ms ? '<span class="ms">◆</span>' : ''}<span class="txt" data-open="${t.id}" data-tip="${esc(t.name)}">${esc(t.name)}</span><span data-tip="${esc(t.status)}" style="color:${stColor(t.status)};font-size:11px">${ST_META[t.status][0]}</span></div>`).join('');
+
+  const st = { l: wrap.scrollLeft, t: wrap.scrollTop };
+  $('#gIn').innerHTML = `<div class="g-left"><div class="g-lh">Task</div>${left || '<div class="empty">No tasks match.</div>'}</div>
+  <div class="g-right" style="width:${W}px"><div class="g-rh"><svg width="${W}" height="46">${top}${h}</svg></div>
+  <svg class="g-body" id="gBody" width="${W}" height="${H}">
+    <defs><marker id="arrowHead" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L7 3.5L0 7Z"/></marker><marker id="arrowCrit" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L8 4L0 8Z"/></marker></defs>
+    ${grid}${rowLines}${peLine}${todayLine}${arrows}${barsHtml}
+  </svg></div>`;
+  wrap.scrollLeft = st.l; wrap.scrollTop = st.t;
+}
+function scrollGanttToToday() {
+  const wrap = $('#gWrap'); if (!wrap || !G) return;
+  wrap.scrollLeft = Math.max(0, G.x(todayN()) - 120);
+}
+let drag = null;
+function ganttPointerDown(e) {
+  const hEl = e.target.closest('[data-h]'), g = e.target.closest('.bar');
+  if (!g || !hEl || e.button !== 0) return;
+  const role = hEl.dataset.h; if (role === 'none') return;
+  const t = I.byId.get(g.dataset.id);
+  const svg = $('#gBody');
+  drag = { role, t, g, x0: e.clientX, y0: e.clientY, moved: false, svg, pid: e.pointerId };
+  if (role === 'resize' && isSum(t)) drag.role = 'move';
+  svg.setPointerCapture(e.pointerId);
+  e.preventDefault();
+}
+function ganttPointerMove(e) {
+  if (!drag) return;
+  const dx = e.clientX - drag.x0;
+  if (!drag.moved && Math.abs(dx) < 3 && Math.abs(e.clientY - drag.y0) < 3) return;
+  drag.moved = true; hideTip();
+  if (drag.role === 'move') { drag.g.setAttribute('transform', `translate(${dx},0)`); drag.g.classList.add('dragging'); showTip(`${drag.t.wbs}: ${dx >= 0 ? '+' : ''}${Math.round(dx / G.ppd)} days`, e.clientX, e.clientY); }
+  else if (drag.role === 'resize') { const r = drag.g.querySelector('.tr'); if (r) { if (drag.w0 == null) drag.w0 = +r.getAttribute('width'); r.setAttribute('width', Math.max(3, drag.w0 + dx)); } showTip(`Ends ${fmt(n2d(d2n(drag.t.end) + Math.round(dx / G.ppd)))}`, e.clientX, e.clientY); }
+  else if (drag.role === 'link') {
+    if (!drag.line) { const c = drag.g.querySelector('.lnk'); drag.line = document.createElementNS('http://www.w3.org/2000/svg', 'line'); drag.line.setAttribute('class', 'rubber'); drag.line.setAttribute('x1', c.getAttribute('cx')); drag.line.setAttribute('y1', c.getAttribute('cy')); drag.svg.appendChild(drag.line); }
+    const b = drag.svg.getBoundingClientRect(); drag.line.setAttribute('x2', e.clientX - b.left); drag.line.setAttribute('y2', e.clientY - b.top);
+    const over = document.elementFromPoint(e.clientX, e.clientY); const og = over && over.closest('.bar');
+    showTip(og && og !== drag.g ? `Link ${drag.t.wbs} → ${I.byId.get(og.dataset.id).wbs}` : 'Drop on the task that should follow', e.clientX, e.clientY);
+  }
+}
+function ganttPointerUp(e) {
+  if (!drag) return;
+  const d = drag; drag = null; hideTip();
+  try { d.svg.releasePointerCapture(d.pid); } catch (err) { /* already released */ }
+  const days = Math.round((e.clientX - d.x0) / G.ppd), t = d.t;
+  if (!d.moved) { if (d.role !== 'link') openTask(t.id); return; }
+  if (d.role === 'link') {
+    if (d.line) d.line.remove();
+    const over = document.elementFromPoint(e.clientX, e.clientY), og = over && over.closest('.bar');
+    if (og && og !== d.g) tryLink(t, I.byId.get(og.dataset.id), 'FS', 0);
+    return;
+  }
+  if (!days) { renderGantt(); return; }
+  if (d.role === 'move') commit(`Moved ${t.wbs} by ${days} days`, () => { shiftTask(t, days); rollup(); cascade([t, ...descendants(t)]); });
+  else commit(`Resized ${t.wbs}`, () => setField(t, 'end', n2d(Math.max(d2n(t.start), d2n(t.end) + days))));
+}
+function tryLink(p, s, type, lag) {
+  const err = linkError(p, s);
+  if (err) return toast(err, 1), false;
+  commit(`Linked ${p.wbs} → ${s.wbs} (${type})`, () => { s.deps.push({ id: p.id, type, lag }); index(); const n = propagate([s]); toast(`Linked ${p.wbs} → ${s.wbs}` + (n ? ` · ${n} task${n > 1 ? 's' : ''} rescheduled` : '')); });
+  return true;
+}
+
+/* ---------- drawer ---------- */
+function openTask(id) { UI.sel = id; renderDrawer(); if (UI.tab === 'gantt') renderGantt(); }
+function renderDrawer() {
+  const dr = $('#drawer'), t = UI.sel && I.byId.get(UI.sel);
+  if (!t) { dr.hidden = true; dr.innerHTML = ''; return; }
+  const sum = isSum(t), dis = sum ? 'disabled' : '', par = parentOf(t);
+  const taskOpts = uniq(P.tasks.map(x => x.owner));
+  const dl = P.tasks.filter(x => x !== t).map(x => `<option value="${esc(x.wbs)}">${esc(x.name.slice(0, 70))}</option>`).join('');
+  const depRow = (d, succ) => {
+    const o = I.byId.get(d.id);
+    return `<div class="dep-row" data-dep-row="${t.id}|${d.id}"><span class="nm" data-open="${o.id}" data-tip="${esc(o.name)}">${esc(o.wbs)} ${esc(o.name)}</span><select data-dep-f="type" aria-label="Type">${DEP_TYPES.map(x => opt(x, d.type)).join('')}</select><input data-dep-f="lag" type="number" value="${d.lag || 0}" aria-label="Lag in workdays"><button class="btn sm" data-act="rmDep" data-s="${t.id}" data-p="${d.id}" aria-label="Remove">✕</button></div>`;
+  };
+  const succs = I.succ.get(t.id).map(s => ({ s, d: s.deps.find(x => x.id === t.id) }));
+  dr.innerHTML = `<div class="dr-head"><div><small>${par ? esc(par.wbs + ' · ' + par.name) : 'Stage'}</small><h3 style="font-size:16px">${esc(t.wbs)} · ${esc(t.name)}</h3></div><button class="btn icon" data-act="closeDrawer" aria-label="Close">✕</button></div>
+  ${sum ? '<div class="muted" style="font-size:12.5px;margin-bottom:8px">📎 This is a summary row. Its dates, status and progress roll up from its sub-tasks.</div>' : ''}
+  <div class="form" data-task="${t.id}">
+    <label class="full">Task name<input data-f="name" value="${esc(t.name)}"></label>
+    <label>Start<input type="date" data-f="start" value="${t.start}" ${dis}></label>
+    <label>End<input type="date" data-f="end" value="${t.end}" ${dis}></label>
+    <label>Duration (workdays)<input type="number" min="0" data-f="dur" value="${t.dur}" ${dis}></label>
+    <label>Progress %<input type="number" min="0" max="100" data-f="progress" value="${t.progress}" ${dis}></label>
+    <label>Status<select data-f="status" ${dis}>${STATUSES.map(s => opt(s, t.status)).join('')}</select></label>
+    <label>Category<input data-f="category" value="${esc(t.category)}" list="dlCats"></label>
+    <label>Task owner<input data-f="owner" value="${esc(t.owner)}" list="dlOwners"></label>
+    <label>Assigned role<input data-f="role" value="${esc(t.role)}"></label>
+    <label class="full">Other participant<input data-f="other" value="${esc(t.other)}"></label>
+    <label>WBS code<input data-f="wbs" value="${esc(t.wbs)}" ${dis}></label>
+    <label>SOW reference<input data-f="sow" value="${esc(t.sow)}"></label>
+    <label class="full" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" data-f="ms" ${t.ms ? 'checked' : ''} style="width:auto"> ◆ Mark as a milestone</label>
+    <label class="full">Scope &amp; deliverable<textarea data-f="scope" rows="3">${esc(t.scope)}</textarea></label>
+    <label class="full">Notes<textarea data-f="notes" rows="2" placeholder="Anything the team should know…">${esc(t.notes)}</textarea></label>
+  </div>
+  <datalist id="dlOwners">${taskOpts.map(o => `<option value="${esc(o)}">`).join('')}</datalist>
+  <datalist id="dlCats">${uniq(P.tasks.map(x => x.category)).map(o => `<option value="${esc(o)}">`).join('')}</datalist>
+  <datalist id="dlTasks">${dl}</datalist>
+  <div class="section-t">⬅ Depends on (predecessors) <small style="font-weight:400">— type · lag in workdays</small></div>
+  ${t.deps.map(d => depRow(d)).join('') || '<div class="muted" style="font-size:12.5px;margin-bottom:6px">No predecessors yet.</div>'}
+  <div class="dep-add"><input id="addPred" list="dlTasks" placeholder="WBS code, e.g. 1.2.3" aria-label="Predecessor WBS code"><select id="addPredType" aria-label="Type">${DEP_TYPES.map(x => opt(x, 'FS')).join('')}</select><input id="addPredLag" type="number" value="0" aria-label="Lag"><button class="btn sm" data-act="addPred" data-id="${t.id}">Add</button></div>
+  ${t.depNote ? `<div class="muted" style="font-size:12px;margin-top:5px">Workbook note: ${esc(t.depNote)}</div>` : ''}
+  <div class="section-t">➡ Followed by (successors)</div>
+  ${succs.map(({ s, d }) => `<div class="dep-row" style="grid-template-columns:1fr 62px 28px"><span class="nm" data-open="${s.id}">${esc(s.wbs)} ${esc(s.name)}</span><span class="muted">${d.type}${d.lag ? (d.lag > 0 ? '+' : '') + d.lag : ''}</span><button class="btn sm" data-act="rmDep" data-s="${s.id}" data-p="${t.id}" aria-label="Remove">✕</button></div>`).join('') || '<div class="muted" style="font-size:12.5px;margin-bottom:6px">Nothing follows this task yet.</div>'}
+  <div class="dep-add" style="grid-template-columns:1fr 62px 58px auto"><input id="addSucc" list="dlTasks" placeholder="WBS code of next task" aria-label="Successor WBS code"><select id="addSuccType" aria-label="Type">${DEP_TYPES.map(x => opt(x, 'FS')).join('')}</select><input id="addSuccLag" type="number" value="0" aria-label="Lag"><button class="btn sm" data-act="addSucc" data-id="${t.id}">Add</button></div>
+  ${t.qa ? `<div class="section-t">Main QA / consultancy tasks</div><div class="ink2" style="font-size:12.5px">${esc(t.qa)}</div>` : ''}
+  ${t.note ? `<div class="section-t">Status note</div><div class="ink2" style="font-size:12.5px">${esc(t.note)}</div>` : ''}
+  <div class="dlg-actions" style="justify-content:space-between"><button class="btn danger" data-act="delTask" data-id="${t.id}">🗑 Delete</button><span><button class="btn" data-act="addChild" data-id="${t.id}">＋ Sub-task</button> <button class="btn" data-act="addMsUnder" data-id="${t.id}">◆ Milestone</button></span></div>`;
+  dr.hidden = false;
+}
+
+/* ---------- other views ---------- */
+function viewMilestones() {
+  const T = todayN();
+  let ms = P.tasks.filter(t => t.ms && match(t)).sort((a, b) => a.end.localeCompare(b.end));
+  if (UI.msFilter === 'open') ms = ms.filter(t => t.status !== 'Done');
+  if (UI.msFilter === 'done') ms = ms.filter(t => t.status === 'Done');
+  const base = P.baseline && P.baseline.map;
+  return `<div class="bar-tools">${filterBar(`<label>Show <select data-act-change="msFilter">${[['open', 'Open'], ['done', 'Done'], ['all', 'All']].map(([v, l]) => opt(v, UI.msFilter, l)).join('')}</select></label>`, false)}<span class="grow"></span><button class="btn pri" data-act="addMilestone">◆ Add milestone</button></div>
+  <div class="scroll" data-scroll="ms"><table><thead><tr><th>WBS</th><th>Milestone</th><th>Stage</th><th>Owner</th><th>Date</th><th>When</th><th>vs baseline</th><th>Status</th><th></th></tr></thead><tbody>
+  ${ms.map(t => {
+    const dd = d2n(t.end) - T, done = t.status === 'Done', slip = base && base[t.id] ? d2n(t.end) - d2n(base[t.id][1]) : null;
+    return `<tr><td class="muted">${esc(t.wbs)}</td><td><span class="ms">◆</span> <a href="#" data-open="${t.id}" style="color:inherit">${esc(t.name)}</a></td><td class="ink2">${esc(stageOf(t).wbs)}. ${esc(stageOf(t).name.slice(0, 30))}</td><td>${esc(t.owner)}</td><td class="nowrap">${fmt(t.end)}</td>
+    <td class="nowrap ${!done && dd < 0 ? 'late' : ''}">${done ? '—' : dd < 0 ? `${-dd} days late` : dd === 0 ? 'Today' : `in ${dd} days`}</td><td class="nowrap">${slip == null ? '—' : slip === 0 ? 'On plan' : (slip > 0 ? '+' : '') + slip + ' d'}</td><td>${pill(t.status)}</td>
+    <td class="nowrap">${isSum(t) ? '' : `<button class="btn sm" data-act="msDone" data-id="${t.id}">${done ? 'Reopen' : '✓ Done'}</button>`} <button class="btn sm" data-act="msOff" data-id="${t.id}" data-tip="Remove milestone flag (keeps the task)">✕</button></td></tr>`;
+  }).join('') || `<tr><td colspan="9"><div class="empty"><div class="big">◆</div>No milestones here yet. Add one to mark a key date.</div></td></tr>`}
+  </tbody></table></div>`;
+}
+const BOARD_CAP = 40;
+function viewBoard() {
+  const ls = leaves().filter(match);
+  return `<div class="bar-tools">${filterBar('', false)}</div><div class="board">${STATUSES.map(s => {
+    const cards = ls.filter(t => t.status === s).sort((a, b) => a.start.localeCompare(b.start)), cap = UI.boardShow[s] || BOARD_CAP;
+    return `<div class="col" data-col="${esc(s)}"><h4><span>${ST_META[s][0]} ${esc(s)}</span><span class="count">${cards.length}</span></h4>
+    ${cards.slice(0, cap).map(t => `<div class="kard" draggable="true" data-card="${t.id}" data-open="${t.id}" style="border-left-color:${stageColor(t)}">${t.ms ? '<span class="ms">◆</span> ' : ''}${esc(t.name)}<small><span>${esc(t.wbs)}</span><span>${fmtS(t.end)}</span></small><small><span>${esc(t.owner)}</span></small></div>`).join('')}
+    ${cards.length > cap ? `<button class="btn sm" data-act="boardMore" data-s="${esc(s)}">Show ${Math.min(BOARD_CAP, cards.length - cap)} more</button>` : ''}</div>`;
+  }).join('')}</div>`;
+}
+function viewWorkload() {
+  const key = { owner: 'owner', role: 'role', other: 'other' }[UI.wlBy];
+  const ls = leaves().filter(match);
+  const groups = uniq(ls.map(t => t[key] || '(Unassigned)'));
+  const T = todayN(), t0 = new Date(T * 864e5);
+  const periods = [];
+  if (UI.wlUnit === 'month') {
+    for (let i = -1; i < 23; i++) { const a = Date.UTC(t0.getUTCFullYear(), t0.getUTCMonth() + i, 1) / 864e5, b = Date.UTC(t0.getUTCFullYear(), t0.getUTCMonth() + i + 1, 1) / 864e5 - 1, d = new Date(a * 864e5); periods.push({ a, b, l: `${MONTHS[d.getUTCMonth()]} ${String(d.getUTCFullYear()).slice(2)}` }); }
+  } else {
+    const S = planStats(); let d = new Date(d2n(S.start) * 864e5); d = new Date(Date.UTC(d.getUTCFullYear(), Math.floor(d.getUTCMonth() / 3) * 3, 1));
+    while (d.getTime() / 864e5 <= d2n(S.finish)) { const a = d.getTime() / 864e5, nx = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 3, 1)); periods.push({ a, b: nx.getTime() / 864e5 - 1, l: `Q${d.getUTCMonth() / 3 + 1} ${String(d.getUTCFullYear()).slice(2)}` }); d = nx; }
+  }
+  const data = groups.map(g => periods.map(p => ls.filter(t => (t[key] || '(Unassigned)') === g && t.status !== 'Done' && d2n(t.start) <= p.b && d2n(t.end) >= p.a).length));
+  const max = Math.max(1, ...data.flat());
+  return `<div class="bar-tools">${filterBar(`<label>Group by <select data-act-change="wlBy">${[['owner', 'Task owner'], ['role', 'Assigned role'], ['other', 'Other participant']].map(([v, l]) => opt(v, UI.wlBy, l)).join('')}</select></label><label>Period <select data-act-change="wlUnit">${[['month', 'Next 24 months'], ['quarter', 'Quarters (whole plan)']].map(([v, l]) => opt(v, UI.wlUnit, l)).join('')}</select></label>`, false)}</div>
+  <div class="scroll"><table class="heat"><thead><tr><th>Open tasks active in period</th>${periods.map(p => `<th>${p.l}</th>`).join('')}</tr></thead><tbody>
+  ${groups.map((g, i) => `<tr><td data-tip="${esc(g)}">${esc(g)}</td>${data[i].map((v, j) => `<td style="background:${v ? `color-mix(in srgb,var(--s1) ${Math.round(8 + 62 * v / max)}%,transparent)` : 'transparent'}" data-tip="${esc(g)}\n${periods[j].l}: ${v} open task${v === 1 ? '' : 's'}">${v || ''}</td>`).join('')}</tr>`).join('') || `<tr><td>No tasks match.</td></tr>`}
+  </tbody></table></div><div class="legend mt"><span>Darker = more open tasks running at the same time (max ${max}). Use it to spot overloaded teams.</span></div>`;
+}
+function viewRisks() {
+  const rs = P.risks;
+  const score = r => (+r.prob || 0) * (+r.impact || 0);
+  const lvl = s => s >= 15 ? ['High', 'var(--danger)'] : s >= 8 ? ['Medium', 'var(--warn)'] : ['Low', 'var(--good)'];
+  const n = v => [1, 2, 3, 4, 5].map(x => opt(String(x), String(v))).join('');
+  return `<div class="bar-tools"><b>Risks, issues, actions and decisions</b> <span class="muted">${rs.filter(r => r.status !== 'Closed').length} open</span><span class="grow"></span><button class="btn pri" data-act="addRisk">＋ Add entry</button></div>
+  ${rs.length ? `<div class="scroll"><table><thead><tr><th>Type</th><th>Title</th><th>WBS</th><th>Owner</th><th>Prob.</th><th>Impact</th><th>Score</th><th>Status</th><th>Due</th><th>Mitigation / next step</th><th></th></tr></thead><tbody>
+  ${rs.map(r => { const s = score(r), L = lvl(s); return `<tr data-risk="${esc(r.id)}"><td><select data-rf="type" style="width:82px">${['Risk', 'Issue', 'Action', 'Decision'].map(x => opt(x, r.type)).join('')}</select></td><td><input data-rf="title" value="${esc(r.title)}" style="min-width:200px"></td><td><input data-rf="wbs" value="${esc(r.wbs)}" style="width:70px"></td><td><input data-rf="owner" value="${esc(r.owner)}" style="min-width:110px"></td><td><select data-rf="prob" style="width:50px">${n(r.prob)}</select></td><td><select data-rf="impact" style="width:50px">${n(r.impact)}</select></td><td class="nowrap"><b>${s}</b> <span style="color:${L[1]}">${L[0]}</span></td><td><select data-rf="status" style="width:95px">${['Open', 'Mitigating', 'Closed'].map(x => opt(x, r.status)).join('')}</select></td><td><input type="date" data-rf="due" value="${esc(r.due)}" style="width:130px"></td><td><input data-rf="plan" value="${esc(r.plan)}" style="min-width:220px"></td><td><button class="btn sm" data-act="delRisk" data-id="${esc(r.id)}" aria-label="Delete">🗑</button></td></tr>`; }).join('')}
+  </tbody></table></div>` : `<div class="card empty"><div class="big">🌤️</div>No entries yet. The workbook has no risk register, so this log starts empty.<br><br><button class="btn pri" data-act="addRisk">＋ Log the first risk</button></div>`}`;
+}
+function healthChecks() {
+  const ls = leaves(), T = todayN(), out = [];
+  const push = (id, sev, title, desc, items) => out.push({ id, sev: items.length ? sev : 'ok', title, desc, items });
+  push('overdue', 'bad', 'Overdue tasks', 'End date has passed and the task is not marked Done.', ls.filter(t => t.status !== 'Done' && d2n(t.end) < T).map(t => [t, `ended ${fmtS(t.end)} · ${t.status}`]));
+  push('late', 'warn', 'Should have started', 'Start date has passed but the status is still Not started.', ls.filter(t => t.status === 'Not started' && d2n(t.start) < T && d2n(t.end) >= T).map(t => [t, `start ${fmtS(t.start)}`]));
+  const viol = []; P.tasks.forEach(t => t.deps.forEach(d => { const r = requiredStart(t, d); if (r > d2n(t.start)) viol.push([t, `starts ${fmtS(t.start)}, but ${I.byId.get(d.id).wbs} (${d.type}) requires ${fmtS(n2d(r))}`]); }));
+  push('viol', 'bad', 'Dependency conflicts', 'The task starts before its predecessor allows. “Fix conflicts” below moves these forward.', viol);
+  const stale = P.tasks.filter(t => isSum(t) && t.srcStatus && t.srcStatus !== t.status).map(t => [t, `workbook said “${t.srcStatus}”, sub-tasks roll up to “${t.status}”`]);
+  push('stat', 'warn', 'Summary status differs from workbook', 'The app derives each summary status from its sub-tasks; these differ from the value typed in the workbook.', stale);
+  const span = P.tasks.filter(t => isSum(t) && t.srcStart && (t.srcStart !== t.start || t.srcEnd !== t.end) && P.baseline && P.baseline.map[t.id] && P.baseline.map[t.id][0] === t.srcStart).map(t => [t, `workbook ${fmtS(t.srcStart)}–${fmtS(t.srcEnd)}, sub-tasks span ${fmtS(t.start)}–${fmtS(t.end)}`]);
+  push('span', 'warn', 'Summary dates differ from workbook', 'Summary rows show the true span of their sub-tasks.', span);
+  push('dup', 'bad', 'Duplicate WBS codes', 'The same code is used twice, so links to it go to the first one. Open the task and give it a unique code.', P.tasks.filter(t => P.tasks.some(o => o !== t && o.wbs === t.wbs)).map(t => [t, 'duplicate code']));
+  push('note', 'warn', 'Unresolved dependency text', 'Workbook dependency text that could not be turned into a link.', P.tasks.filter(t => /Unknown predecessor|after project end/i.test(t.depNote)).map(t => [t, t.depNote]));
+  push('own', 'warn', 'Tasks without an owner', 'Bottom-level tasks with no task owner.', ls.filter(t => !t.owner).map(t => [t, 'no owner']));
+  push('dur', 'warn', 'Tasks without a duration', 'Bottom-level tasks with a zero duration that are not milestones.', ls.filter(t => !t.dur && !t.ms).map(t => [t, 'no duration']));
+  if (P.meta.projectEnd) push('end', 'bad', 'Past the project end date', `Bottom-level tasks finishing after the project end date (${fmtS(P.meta.projectEnd)}). Warranty tasks may be expected here.`, ls.filter(t => t.end > P.meta.projectEnd).map(t => [t, `ends ${fmtS(t.end)}`]));
+  return out;
+}
+function viewHealth() {
+  const C = healthChecks();
+  const rank = { bad: 0, warn: 1, ok: 2 };
+  C.sort((a, b) => rank[a.sev] - rank[b.sev]);
+  const clean = C.filter(c => c.sev === 'ok').length;
+  return `<div class="bar-tools"><b>${clean} of ${C.length} checks are clear</b><span class="grow"></span><button class="btn" data-act="fixConflicts">🛠 Fix dependency conflicts</button></div>
+  <div class="grid">${C.map(c => `<div class="card chk ${c.sev}"><details ${UI.openChk === c.id ? 'open' : ''}><summary><b>${c.sev === 'ok' ? '✓' : c.sev === 'bad' ? '⚠' : '•'} ${esc(c.title)}</b><span class="count">${c.items.length}</span></summary><p>${esc(c.desc)}</p>
+  <div class="chk-list">${c.items.slice(0, 200).map(([t, m]) => `<div data-open="${t.id}"><span class="muted">${esc(t.wbs)}</span> ${esc(t.name)} — <span class="ink2">${esc(m)}</span></div>`).join('')}${c.items.length > 200 ? `<div class="muted">…and ${c.items.length - 200} more</div>` : ''}</div></details></div>`).join('')}</div>`;
+}
+function viewSettings() {
+  return `<div class="grid two">
+  <div class="card"><h3>Project</h3><div class="form">
+    <label class="full">Title<input data-meta-in="title" value="${esc(P.meta.title)}"></label>
+    <label class="full">Subtitle<input data-meta-in="subtitle" value="${esc(P.meta.subtitle)}"></label>
+    <label>Project end date<input type="date" data-meta-in="projectEnd" value="${esc(P.meta.projectEnd)}"></label>
+    <label>Source<input value="${esc(P.meta.source || '')}" disabled></label>
+  </div></div>
+  <div class="card"><h3>Schedule rules</h3><div class="form">
+    <label class="full" style="flex-direction:row;gap:8px;align-items:center"><input type="checkbox" id="autoSched" style="width:auto" ${P.settings.autoSched ? 'checked' : ''}> Auto-push later tasks when a predecessor moves</label>
+    <label class="full">Holidays, one date per line (YYYY-MM-DD). Weekends are Saturday and Sunday.<textarea id="holidays" rows="4" placeholder="2027-01-01">${esc((P.settings.holidays || []).join('\n'))}</textarea></label>
+  </div><p class="muted" style="font-size:12.5px;margin:8px 0 0">The workbook counts no holidays, so none are set. Adding them only affects tasks you change afterwards.</p></div>
+  <div class="card"><h3>Baseline</h3><p class="ink2" style="margin-top:0">Current baseline: <b>${esc((P.baseline && P.baseline.label) || 'none')}</b>${P.baseline ? ` · ${fmt(P.baseline.savedAt.slice(0, 10))}` : ''}. Compare against it on the Gantt and Milestones tabs.</p><button class="btn" data-act="setBaseline">📐 Save current plan as baseline</button></div>
+  <div class="card"><h3>Start over</h3><p class="ink2" style="margin-top:0">Replace all changes in this browser with the plan as first published. Save a project file first if you want a copy.</p><button class="btn danger" data-act="resetPlan">↺ Reset to original plan</button></div>
+  <div class="card" style="grid-column:1/-1"><h3>Activity log</h3><div style="max-height:320px;overflow:auto">${P.log.map(l => `<div class="mini-row" style="cursor:default"><span>${esc(l.what)}</span><span class="muted nowrap">${esc(new Date(l.at).toLocaleString())}</span></div>`).join('') || '<div class="muted">Changes you make will be listed here.</div>'}</div></div>
+  </div>`;
+}
+
+/* ---------- rendering ---------- */
+const VIEWS = { summary: viewSummary, wbs: viewWbs, gantt: viewGantt, milestones: viewMilestones, board: viewBoard, workload: viewWorkload, risks: viewRisks, health: viewHealth, settings: viewSettings };
+function renderTabs() {
+  const S = healthChecks().filter(c => c.sev === 'bad').length;
+  $('#tabs').innerHTML = TABS.map(([id, ic, l]) => `<button role="tab" aria-selected="${UI.tab === id}" data-act="goto" data-tab="${id}">${ic} ${l}${id === 'health' && S ? `<span class="count">${S}</span>` : ''}</button>`).join('');
+}
+function rememberScroll() { $$('[data-scroll]').forEach(el => { scrollMem[el.dataset.scroll] = [el.scrollLeft, el.scrollTop]; }); }
+function renderView() {
+  rememberScroll();
+  $('#view').innerHTML = VIEWS[UI.tab]();
+  if (UI.tab === 'gantt') renderGantt();
+  $$('[data-scroll]').forEach(el => { const m = scrollMem[el.dataset.scroll]; if (m) { el.scrollLeft = m[0]; el.scrollTop = m[1]; } });
+  if (UI.tab === 'gantt' && !scrollMem.gantt) scrollGanttToToday();
+}
+function renderGanttFresh() { // timeline range changes, so the old scroll offset is meaningless
+  $('#view').innerHTML = VIEWS.gantt(); renderGantt(); delete scrollMem.gantt; scrollGanttToToday();
+}
+function renderAll() { $('#appTitle').textContent = P.meta.title + ' · Planner'; renderTabs(); renderView(); renderDrawer(); saveUI(); }
+
+/* ---------- ui helpers ---------- */
+function toast(msg, err) {
+  const d = document.createElement('div'); d.className = 'toast' + (err ? ' err' : ''); d.textContent = msg;
+  $('#toast').appendChild(d); setTimeout(() => d.remove(), err ? 5000 : 3000);
+}
+function showTip(text, x, y) { const t = $('#tip'); t.textContent = text; t.hidden = false; t.style.left = Math.min(x + 14, innerWidth - t.offsetWidth - 8) + 'px'; t.style.top = Math.min(y + 14, innerHeight - t.offsetHeight - 8) + 'px'; }
+function hideTip() { $('#tip').hidden = true; }
+function dialog(title, body, onOk, okLabel = 'Save') {
+  const m = $('#modal');
+  m.innerHTML = `<h3>${esc(title)}</h3><form method="dialog" id="dlgForm">${body}<div class="dlg-actions"><button type="button" class="btn" data-act="dlgClose">${onOk ? 'Cancel' : 'Close'}</button>${onOk ? `<button class="btn pri" value="ok">${esc(okLabel)}</button>` : ''}</div></form>`;
+  $('#dlgForm').addEventListener('submit', e => { e.preventDefault(); if (onOk && onOk(new FormData(e.target)) !== false) m.close(); });
+  m.showModal();
+}
+function download(name, blob) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }
+const stamp = () => new Date().toISOString().slice(0, 10);
+function parentOptions() { return P.tasks.filter(t => t.depth <= 3).map(t => opt(t.id, '', `${t.wbs} ${t.name.slice(0, 60)}`)).join(''); }
+
+function dlgAddTask(isMs, parent) {
+  dialog(isMs ? '◆ Add a milestone' : '＋ Add a task', `<div class="form">
+    <label class="full">Name<input name="name" required autofocus placeholder="${isMs ? 'e.g. Steering Committee approval' : 'e.g. Draft test plan'}"></label>
+    <label class="full">Goes under<select name="parent">${parent ? opt(parent.id, parent.id, `${parent.wbs} ${parent.name.slice(0, 60)}`) : parentOptions()}</select></label>
+    <label>${isMs ? 'Date' : 'Start'}<input type="date" name="date" required value="${n2d(snap(todayN()))}"></label>
+    ${isMs ? '' : '<label>Duration (workdays)<input type="number" name="dur" min="1" value="5"></label>'}
+    <label class="full">Depends on (optional WBS code)<input name="pred" placeholder="e.g. 1.2.3"></label></div>`, fd => {
+    const par = I.byId.get(fd.get('parent')), pc = String(fd.get('pred') || '').trim();
+    const p = pc ? I.byWbs.get(pc) : null;
+    if (pc && !p) { toast(`No task with WBS ${pc}`, 1); return false; }
+    commit(`Added ${isMs ? 'milestone' : 'task'} “${fd.get('name')}”`, () => {
+      const t = addTask(par, { name: String(fd.get('name')), start: fd.get('date'), dur: isMs ? 0 : Math.max(1, +fd.get('dur') || 1), ms: isMs });
+      if (p) { const err = linkError(p, t); if (err) toast(err, 1); else { t.deps.push({ id: p.id, type: 'FS', lag: 0 }); index(); } }
+      propagate([t]); UI.sel = t.id;
+    });
+  }, 'Add');
+}
+function dlgDep(succId, predId) {
+  const s = I.byId.get(succId), p = I.byId.get(predId), d = s.deps.find(x => x.id === predId);
+  if (!d) return;
+  dialog('Edit dependency', `<p class="ink2" style="margin-top:0"><b>${esc(p.wbs)}</b> ${esc(p.name)}<br>→ <b>${esc(s.wbs)}</b> ${esc(s.name)}</p><div class="form"><label>Type<select name="type">${DEP_TYPES.map(x => opt(x, d.type, DEP_LABEL[x])).join('')}</select></label><label>Lag (workdays, negative = overlap)<input type="number" name="lag" value="${d.lag || 0}"></label></div><div style="margin-top:10px"><button type="button" class="btn danger" data-act="rmDep" data-s="${s.id}" data-p="${p.id}" data-close="1">🗑 Remove this link</button></div>`, fd => {
+    commit(`Edited link ${p.wbs} → ${s.wbs}`, () => { d.type = fd.get('type'); d.lag = +fd.get('lag') || 0; propagate([s]); });
+  });
+}
+function dlgLinks() {
+  const all = []; P.tasks.forEach(s => s.deps.forEach(d => all.push({ s, d, p: I.byId.get(d.id) })));
+  const dl = P.tasks.map(x => `<option value="${esc(x.wbs)}">${esc(x.name.slice(0, 70))}</option>`).join('');
+  dialog('🔗 Manage dependencies', `<div class="section-t" style="margin-top:0">Add a dependency</div><div class="form" style="grid-template-columns:1fr 1fr 110px 70px"><label>This task finishes first<input name="p" list="dlAll" placeholder="WBS, e.g. 1.2"></label><label>…before this one<input name="s" list="dlAll" placeholder="WBS, e.g. 1.3"></label><label>Type<select name="type">${DEP_TYPES.map(x => opt(x, 'FS')).join('')}</select></label><label>Lag<input type="number" name="lag" value="0"></label></div><datalist id="dlAll">${dl}</datalist>
+  <div class="section-t">All dependencies (${all.length})</div><div style="max-height:40vh;overflow:auto"><table><thead><tr><th>From</th><th>To</th><th>Type</th><th>Lag</th><th></th></tr></thead><tbody>${all.map(({ s, d, p }) => `<tr><td data-tip="${esc(p.name)}">${esc(p.wbs)}</td><td data-tip="${esc(s.name)}">${esc(s.wbs)}</td><td>${d.type}</td><td>${d.lag || 0}</td><td><button type="button" class="btn sm" data-act="editDep" data-s="${s.id}" data-p="${p.id}">Edit</button></td></tr>`).join('')}</tbody></table></div>`, fd => {
+    const p = I.byWbs.get(String(fd.get('p')).trim()), s = I.byWbs.get(String(fd.get('s')).trim());
+    return tryLink(p, s, fd.get('type'), +fd.get('lag') || 0) ? undefined : false;
+  }, 'Add link');
+}
+function dlgHelp() {
+  dialog('👋 Quick guide', `<ul class="help" style="padding-left:18px;margin:0">
+  <li><b>Open a task:</b> click its name anywhere to edit all its details in the side panel.</li>
+  <li><b>WBS:</b> click a cell to edit it. Use ＋ on a row to add a sub-task and ◆ for a milestone. Grey summary values roll up automatically.</li>
+  <li><b>Move tasks:</b> on the Gantt, drag a bar to move it and drag its right edge to resize.</li>
+  <li><b>Add dependencies:</b> hover a bar and drag the ○ onto the next task, or use Manage dependencies. Types: FS, SS, FF, SF, with lag in workdays.</li>
+  <li><b>Milestones:</b> use ◆ Add milestone, or tick “Mark as a milestone” on any task.</li>
+  <li><b>Auto-scheduling:</b> when a task moves, the tasks that depend on it are pushed later if needed. Turn this off in Settings.</li>
+  <li><b>Saving:</b> changes stay in this browser. To pass them on, use File › Save project file and send it, or File › Export to Excel.</li>
+  <li><b>Undo:</b> Ctrl+Z and Ctrl+Y.</li></ul>`);
+}
+function dlgShare() {
+  const onWeb = /^https?:/.test(location.protocol), url = location.href.split('#')[0];
+  dialog('🔗 Share this plan', `<p class="ink2" style="margin-top:0">${onWeb ? 'Anyone with this link can open the plan:' : 'This copy is running from your computer. The online link is available once it is published.'}</p>
+  ${onWeb ? `<input id="shareUrl" readonly value="${esc(url)}" style="width:100%"><div style="margin:8px 0 12px"><button type="button" class="btn sm" data-act="copyUrl">📋 Copy link</button></div>` : ''}
+  <div class="section-t">How edits are shared</div><ul class="help ink2" style="padding-left:18px;margin:0">
+  <li>Each person's edits stay in their own browser until shared.</li>
+  <li><b>To update everyone:</b> use File › Save project file, name it <code>project.json</code>, and upload it to the GitHub repository. Visitors then get a prompt to load the newer plan.</li>
+  <li><b>To send one person a copy:</b> email the project file; they use File › Open project file.</li></ul>`);
+}
+
+/* ---------- import / export ---------- */
+function exportJson() { save(); download(`NSDI_Plan_${stamp()}.json`, new Blob([JSON.stringify({ app: 'nsdi-planner', version: 1, savedAt: P.meta.savedAt, project: P }, null, 1)], { type: 'application/json' })); toast('Project file saved'); }
+function loadProjectObject(obj, name) {
+  const p = obj && obj.project ? obj.project : obj;
+  if (!validProject(p)) { toast('That file is not a valid project file', 1); return false; }
+  if (undoStack.length < 40) undoStack.push(JSON.stringify({ tasks: P.tasks, risks: P.risks, meta: P.meta, settings: P.settings, baseline: P.baseline }));
+  adopt(p); logIt('Loaded ' + name); save(); setLevel(UI.level); UI.sel = null; renderAll(); toast('Loaded ' + name);
+  return true;
+}
+const XSER = n => n + 25569;
+function exportXlsx() {
+  if (!window.XLSX) return toast('Excel library did not load', 1);
+  const X = window.XLSX, head = ['Stage', 'WBS Code', 'Task / Component Description', 'WBS Level', 'Category', 'Scope & Deliverable Summary', 'Task Owner', 'Assigned Owner / Role', 'Other Participant', 'Status note (V6/SOW)', 'Status', 'Progress %', 'Est. duration (workdays)', 'Dependencies', 'Start date', 'End date', 'SOW Reference', 'Milestone', 'Notes'];
+  const dc = s => ({ t: 'n', v: XSER(d2n(s)), z: 'dd-mmm-yyyy' });
+  const rows = P.tasks.map(t => [stageOf(t).wbs, t.wbs, t.name, 'L' + t.depth, t.category, t.scope, t.owner, t.role, t.other, t.note, t.status, t.progress, t.dur, [depStr(t), t.depNote].filter(Boolean).join('; '), dc(t.start), dc(t.end), t.sow, t.ms ? 'Yes' : '', t.notes]);
+  const wb = X.utils.book_new();
+  const ws = X.utils.aoa_to_sheet([head, ...rows]);
+  ws['!cols'] = [6, 11, 54, 7, 12, 40, 18, 22, 22, 14, 13, 9, 9, 22, 12, 12, 12, 9, 26].map(wch => ({ wch })); ws['!autofilter'] = { ref: `A1:S${rows.length + 1}` }; ws['!freeze'] = { xSplit: 3, ySplit: 1 };
+  X.utils.book_append_sheet(wb, ws, 'WBS & Task Breakdown');
+  const sm = P.tasks.filter(t => t.depth <= 2).map(t => [t.wbs, t.name, t.scope, t.qa, t.status, t.progress, dc(t.start), dc(t.end), t.dur]);
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['WBS Code', 'Task / Component Description', 'Scope summary', 'Main QA / consultancy tasks', 'Status', 'Progress %', 'Start', 'End', 'Workdays span'], ...sm]), 'Executive Summary');
+  const dp = []; P.tasks.forEach(s => s.deps.forEach(d => { const p = I.byId.get(d.id); dp.push([p.wbs, p.name, s.wbs, s.name, d.type, d.lag || 0]); }));
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['From WBS', 'From task', 'To WBS', 'To task', 'Type', 'Lag (workdays)'], ...dp]), 'Dependencies');
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['WBS', 'Milestone', 'Date', 'Owner', 'Status'], ...P.tasks.filter(t => t.ms).map(t => [t.wbs, t.name, dc(t.end), t.owner, t.status])]), 'Milestones');
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([['Type', 'Title', 'WBS', 'Owner', 'Probability', 'Impact', 'Score', 'Status', 'Due', 'Mitigation'], ...P.risks.map(r => [r.type, r.title, r.wbs, r.owner, r.prob, r.impact, (+r.prob || 0) * (+r.impact || 0), r.status, r.due, r.plan])]), 'Risks & Issues');
+  X.writeFile(wb, `NSDI_Plan_${stamp()}.xlsx`);
+  toast('Excel file exported');
+}
+function importWorkbook(buf, name) {
+  const X = window.XLSX; const wb = X.read(buf, { type: 'array' });
+  const wsName = wb.SheetNames.find(n => /wbs.*task|task.*breakdown/i.test(n)) || wb.SheetNames[0];
+  const aoa = X.utils.sheet_to_json(wb.Sheets[wsName], { header: 1, raw: true, defval: '' });
+  const hi = aoa.findIndex(r => r.some(c => /^wbs code$/i.test(String(c).trim())));
+  if (hi < 0) return toast('Could not find a “WBS Code” column in that workbook', 1);
+  const col = re => aoa[hi].findIndex(c => re.test(String(c).trim()));
+  const C = { wbs: col(/^wbs code$/i), name: col(/^task \/ component/i), category: col(/^category$/i), scope: col(/^scope/i), owner: col(/^task owner$/i), role: col(/^assigned owner/i), other: col(/^other participant/i), note: col(/^status note/i), status: col(/^status$/i), dur: col(/^est\. duration/i), deps: col(/^dependencies$/i), start: col(/^start date$/i), end: col(/^end date$/i), sow: col(/^sow/i), prog: col(/^progress/i), ms: col(/^milestone$/i), notes: col(/^notes$/i) };
+  if (C.start < 0 || C.end < 0) return toast('The workbook needs “Start date” and “End date” columns', 1);
+  const dt = v => { if (typeof v === 'number') return n2d(Math.floor(v) - 25569); if (v instanceof Date) return v.toISOString().slice(0, 10); const s = String(v).trim(); return isISO(s) ? s : ''; };
+  const g = (r, k) => (C[k] >= 0 ? r[C[k]] : '');
+  const rows = aoa.slice(hi + 1).filter(r => String(g(r, 'wbs')).trim() && dt(g(r, 'start')) && dt(g(r, 'end'))).map(r => ({ wbs: String(g(r, 'wbs')).trim(), name: String(g(r, 'name')).trim(), category: String(g(r, 'category')).trim(), scope: String(g(r, 'scope')).trim(), owner: String(g(r, 'owner')).trim(), role: String(g(r, 'role')).trim(), other: String(g(r, 'other')).trim(), note: String(g(r, 'note')).trim(), status: String(g(r, 'status')).trim(), dur: g(r, 'dur'), deps: String(g(r, 'deps')).trim(), start: dt(g(r, 'start')), end: dt(g(r, 'end')), sow: String(g(r, 'sow')).trim(), qa: '', _p: g(r, 'prog'), _m: g(r, 'ms'), _n: g(r, 'notes') }));
+  if (!rows.length) return toast('No tasks with dates found in that workbook', 1);
+  wb.SheetNames.forEach(n => { // Main QA text lives on the summary sheet
+    const a = X.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' });
+    const h = a.findIndex(r => r.some(c => /^main qa/i.test(String(c).trim())) && r.some(c => /^wbs code$/i.test(String(c).trim())));
+    if (h < 0) return;
+    const cc = a[h].findIndex(c => /^wbs code$/i.test(String(c).trim())), cq = a[h].findIndex(c => /^main qa/i.test(String(c).trim()));
+    const qa = new Map(a.slice(h + 1).map(r => [String(r[cc]).trim(), String(r[cq]).trim()]));
+    rows.forEach(r => { if (qa.get(r.wbs)) r.qa = qa.get(r.wbs); });
+  });
+  dialog('📥 Import from Excel', `<p>Found <b>${rows.length}</b> tasks in “${esc(wsName)}” of ${esc(name)}. This replaces the plan in this browser; you can undo it right after.</p>`, () => {
+    const np = buildFromRows(rows, name);
+    np.meta = Object.assign({}, P.meta, { source: name });
+    np.risks = P.risks;
+    rows.forEach((r, i) => { const t = np.tasks[i]; if (!t) return; if (r._p !== '' && r._p != null && !isNaN(+r._p)) t.progress = clamp(+r._p, 0, 100); if (String(r._m).toLowerCase() === 'yes') t.ms = true; if (r._n) t.notes = String(r._n); });
+    loadProjectObject(np, name);
+  }, 'Replace plan');
+}
+function checkPublished() {
+  if (!/^https?:/.test(location.protocol)) return;
+  fetch('project.json', { cache: 'no-store' }).then(r => (r.ok ? r.json() : null)).then(obj => {
+    if (!obj) return;
+    const p = obj.project || obj; if (!validProject(p)) return;
+    const pub = obj.savedAt || (p.meta && p.meta.savedAt) || '';
+    let seen = ''; try { seen = localStorage.getItem(KEY + '-pub') || ''; } catch (e) { /* optional */ }
+    if (pub <= seen) return;
+    const accept = () => { try { localStorage.setItem(KEY + '-pub', pub); } catch (e) { /* optional */ } };
+    if (!hadLocal) { accept(); adopt(p); setLevel(UI.level); renderAll(); return; }
+    $('#banner').innerHTML = `<div><span>📬 A newer shared plan was published on ${esc(new Date(pub).toLocaleString())}.</span><span><button class="btn sm pri" id="pubLoad">Load it (replaces my copy)</button> <button class="btn sm" id="pubSkip">Keep mine</button></span></div>`;
+    $('#pubLoad').onclick = () => { accept(); $('#banner').innerHTML = ''; loadProjectObject(obj, 'published plan'); };
+    $('#pubSkip').onclick = () => { accept(); $('#banner').innerHTML = ''; };
+  }).catch(() => { /* no published plan */ });
+}
+
+/* ---------- events ---------- */
+const ACTIONS = {
+  undo: () => restore(undoStack, redoStack, 'undo'),
+  redo: () => restore(redoStack, undoStack, 'redo'),
+  theme: () => { const r = document.documentElement, dark = r.dataset.theme ? r.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; r.dataset.theme = dark ? 'light' : 'dark'; saveUI(); },
+  help: dlgHelp, share: dlgShare,
+  copyUrl: () => { const u = $('#shareUrl'); (navigator.clipboard ? navigator.clipboard.writeText(u.value) : Promise.reject()).then(() => toast('Link copied'), () => { u.select(); toast('Press Ctrl+C to copy'); }); },
+  saveJson: exportJson, exportXlsx,
+  loadJson: () => $('#fileJson').click(),
+  importXlsx: () => $('#fileXlsx').click(),
+  print: () => {
+    if (UI.tab === 'gantt' && UI.zoom !== 'Fit') { const z = UI.zoom; UI.zoom = 'Fit'; renderGantt(); window.addEventListener('afterprint', () => { UI.zoom = z; renderGantt(); }, { once: true }); }
+    window.print();
+  },
+  goto: el => { UI.tab = el.dataset.tab; renderTabs(); renderView(); saveUI(); $('#view').scrollTop = 0; window.scrollTo(0, 0); },
+  dismissWelcome: () => { UI.welcome = false; saveUI(); renderView(); },
+  clearFilters: () => { Object.keys(F).forEach(k => { F[k] = ''; }); renderView(); },
+  toggle: el => { const id = el.dataset.id; collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id); renderView(); },
+  expandAll: () => { collapsed.clear(); UI.level = 6; renderView(); },
+  collapseAll: () => { setLevel(1); renderView(); },
+  focusStage: el => { F.stage = el.dataset.wbs; UI.tab = 'gantt'; renderTabs(); rememberScroll(); delete scrollMem.gantt; renderGanttFresh(); },
+  zoom: el => { UI.zoom = el.dataset.z; renderGanttFresh(); saveUI(); },
+  scrollToday: scrollGanttToToday,
+  flag: el => { UI[el.dataset.k] = !UI[el.dataset.k]; renderView(); saveUI(); },
+  closeDrawer: () => { UI.sel = null; renderDrawer(); if (UI.tab === 'gantt') renderGantt(); },
+  addStage: () => dialog('＋ Add a stage', `<div class="form"><label class="full">Stage name<input name="name" required autofocus></label><label>Start<input type="date" name="date" value="${n2d(snap(todayN()))}" required></label></div>`, fd => { commit(`Added stage “${fd.get('name')}”`, () => { const t = addTask(null, { name: String(fd.get('name')), start: fd.get('date'), category: 'Phase', dur: 5 }); UI.sel = t.id; }); }, 'Add'),
+  addTaskDlg: () => dlgAddTask(false, UI.sel ? I.byId.get(UI.sel) : null),
+  addMilestone: () => dlgAddTask(true, UI.sel ? I.byId.get(UI.sel) : null),
+  addChild: el => { const p = I.byId.get(el.dataset.id); commit(`Added sub-task under ${p.wbs}`, () => { const t = addTask(p, { start: p.start }); UI.sel = t.id; }); },
+  addMsUnder: el => dlgAddTask(true, I.byId.get(el.dataset.id)),
+  delTask: el => {
+    const t = I.byId.get(el.dataset.id), n = descendants(t).length;
+    dialog('Delete this task?', `<p><b>${esc(t.wbs)} ${esc(t.name)}</b>${n ? ` and its ${n} sub-task${n > 1 ? 's' : ''}` : ''} will be removed, along with any links to them. You can undo this.</p>`, () => { commit(`Deleted ${t.wbs} ${t.name}`, () => removeTask(t)); }, 'Delete');
+  },
+  addPred: el => { const s = I.byId.get(el.dataset.id), p = I.byWbs.get($('#addPred').value.trim()); tryLink(p, s, $('#addPredType').value, +$('#addPredLag').value || 0); },
+  addSucc: el => { const p = I.byId.get(el.dataset.id), s = I.byWbs.get($('#addSucc').value.trim()); tryLink(p, s, $('#addSuccType').value, +$('#addSuccLag').value || 0); },
+  rmDep: el => { const s = I.byId.get(el.dataset.s), pid = el.dataset.p; if (el.dataset.close) $('#modal').close(); commit(`Removed link to ${s.wbs}`, () => { s.deps = s.deps.filter(d => d.id !== pid); }); },
+  editDep: el => { const s = el.dataset.s, p = el.dataset.p; $('#modal').close(); dlgDep(s, p); },
+  manageLinks: dlgLinks,
+  dlgClose: () => $('#modal').close(),
+  msDone: el => { const t = I.byId.get(el.dataset.id); commit(`Milestone ${t.wbs} ${t.status === 'Done' ? 'reopened' : 'done'}`, () => setField(t, 'status', t.status === 'Done' ? 'Not started' : 'Done')); },
+  msOff: el => { const t = I.byId.get(el.dataset.id); commit(`Removed milestone flag from ${t.wbs}`, () => { t.ms = false; }); },
+  boardMore: el => { const s = el.dataset.s; UI.boardShow[s] = (UI.boardShow[s] || BOARD_CAP) + BOARD_CAP; renderView(); },
+  addRisk: () => commit('Added a log entry', () => { P.risks.unshift({ id: 'r' + Date.now().toString(36), type: 'Risk', title: 'New entry', wbs: '', owner: '', prob: 3, impact: 3, status: 'Open', due: '', plan: '' }); }),
+  delRisk: el => commit('Deleted a log entry', () => { P.risks = P.risks.filter(r => r.id !== el.dataset.id); }),
+  fixConflicts: () => {
+    const before = healthChecks().find(c => c.id === 'viol').items.length;
+    if (!before) return toast('No dependency conflicts to fix 🎉');
+    dialog('Fix dependency conflicts?', `<p>${before} link${before > 1 ? 's' : ''} break the dependency rules. This moves those tasks, and any tasks that follow them, later as needed. Some dates will change, and you can undo this.</p>`, () => {
+      commit('Fixed dependency conflicts', () => {
+        const was = P.settings.autoSched; P.settings.autoSched = true;
+        const n = propagate(P.tasks.filter(t => t.deps.length)); P.settings.autoSched = was;
+        toast(`${n} tasks rescheduled`);
+      });
+    }, 'Fix conflicts');
+  },
+  setBaseline: () => dialog('📐 Save baseline', `<div class="form"><label class="full">Label<input name="label" value="Baseline ${stamp()}" required></label></div>`, fd => { commit('Saved a new baseline', () => { P.baseline = { label: String(fd.get('label')), savedAt: new Date().toISOString(), map: Object.fromEntries(P.tasks.map(t => [t.id, [t.start, t.end]])) }; }); }),
+  resetPlan: () => dialog('Reset to the original plan?', '<p>All changes in this browser will be replaced. You can undo this until you close the page.</p>', () => { const np = buildFromRows(window.SEED_ROWS, window.SEED_SOURCE); loadProjectObject(np, 'original plan'); }, 'Reset')
+};
+document.addEventListener('click', e => {
+  const m = e.target.closest('details.menu');
+  $$('details.menu[open]').forEach(d => { if (d !== m) d.open = false; });
+  const a = e.target.closest('[data-act]');
+  if (a && ACTIONS[a.dataset.act]) {
+    if (a.tagName === 'A') e.preventDefault();
+    if (m) m.open = false;
+    ACTIONS[a.dataset.act](a);
+    return;
+  }
+  const o = e.target.closest('[data-open]');
+  if (o) { e.preventDefault(); openTask(o.dataset.open); return; }
+  const dep = e.target.closest('[data-dep]');
+  if (dep) { const [s, p] = dep.dataset.dep.split('|'); dlgDep(s, p); return; }
+  const td = e.target.closest('td[data-e]');
+  if (td) startCellEdit(td);
+});
+document.addEventListener('input', e => {
+  const k = e.target.dataset && e.target.dataset.filter;
+  if (k === 'q') { F.q = e.target.value; clearTimeout(ACTIONS._q); ACTIONS._q = setTimeout(() => { const pos = e.target.selectionStart; renderView(); const s = $('[data-filter=q]'); if (s) { s.focus(); s.setSelectionRange(pos, pos); } }, 220); }
+});
+document.addEventListener('change', async e => {
+  const el = e.target, ds = el.dataset || {};
+  if (ds.filter && ds.filter !== 'q') { F[ds.filter] = el.value; if (UI.tab === 'gantt') renderGanttFresh(); else renderView(); return; }
+  if (ds.actChange === 'level') { setLevel(+el.value); renderView(); return; }
+  if (ds.actChange) { UI[ds.actChange] = el.value; renderView(); saveUI(); return; }
+  if (ds.f) {
+    const form = el.closest('[data-task]'), t = I.byId.get(form.dataset.task);
+    const v = el.type === 'checkbox' ? el.checked : el.value;
+    if (!commit(`Changed ${ds.f} of ${t.wbs}`, () => setField(t, ds.f, v))) renderDrawer();
+    return;
+  }
+  if (ds.depF) {
+    const [sid, pid] = el.closest('[data-dep-row]').dataset.depRow.split('|'), s = I.byId.get(sid), d = s.deps.find(x => x.id === pid);
+    commit(`Edited link to ${s.wbs}`, () => { if (ds.depF === 'type') d.type = el.value; else d.lag = +el.value || 0; propagate([s]); });
+    return;
+  }
+  if (ds.rf) { const r = P.risks.find(x => x.id === el.closest('[data-risk]').dataset.risk); commit('Edited a log entry', () => { r[ds.rf] = el.value; }); return; }
+  if (ds.metaIn) { commit(`Changed project ${ds.metaIn}`, () => { P.meta[ds.metaIn] = el.value; }); return; }
+  if (el.id === 'autoSched') { commit('Changed auto-scheduling', () => { P.settings.autoSched = el.checked; }); return; }
+  if (el.id === 'holidays') {
+    const list = el.value.split(/\s+/).filter(Boolean), bad = list.filter(x => !isISO(x));
+    if (bad.length) { toast('Not a date: ' + bad[0], 1); return; }
+    commit('Changed holidays', () => { P.settings.holidays = list; });
+    return;
+  }
+  if (el.id === 'fileJson' && el.files[0]) {
+    const f = el.files[0]; el.value = '';
+    try { loadProjectObject(JSON.parse(await f.text()), f.name); } catch (err) { toast('Could not read that file', 1); }
+    return;
+  }
+  if (el.id === 'fileXlsx' && el.files[0]) {
+    const f = el.files[0]; el.value = '';
+    try { importWorkbook(await f.arrayBuffer(), f.name); } catch (err) { toast('Could not read that workbook', 1); }
+  }
+});
+document.addEventListener('focusout', e => {
+  const k = e.target.dataset && e.target.dataset.meta;
+  if (k) { const v = e.target.textContent.trim(); if (v && v !== P.meta[k]) commit(`Changed project ${k}`, () => { P.meta[k] = v; }); }
+});
+document.addEventListener('keydown', e => {
+  const editing = /INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.target.isContentEditable;
+  if ((e.ctrlKey || e.metaKey) && !editing) {
+    if (e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? ACTIONS.redo() : ACTIONS.undo(); }
+    if (e.key.toLowerCase() === 'y') { e.preventDefault(); ACTIONS.redo(); }
+  }
+  if (e.key === 'Escape' && UI.sel && !$('#modal').open && !editing) ACTIONS.closeDrawer();
+  if (e.key === 'Enter' && e.target.dataset && e.target.dataset.meta && e.target.dataset.meta !== 'headline') { e.preventDefault(); e.target.blur(); }
+});
+document.addEventListener('pointerdown', e => { if (e.target.closest && e.target.closest('#gBody')) ganttPointerDown(e); });
+document.addEventListener('pointermove', ganttPointerMove);
+document.addEventListener('pointerup', ganttPointerUp);
+document.addEventListener('mouseover', e => {
+  if (drag) return;
+  const el = e.target.closest && e.target.closest('[data-tip]');
+  if (el && el.dataset.tip) showTip(el.dataset.tip, e.clientX, e.clientY); else hideTip();
+});
+document.addEventListener('mousemove', e => { if (!drag && !$('#tip').hidden) showTip($('#tip').textContent, e.clientX, e.clientY); });
+document.addEventListener('dragstart', e => { const c = e.target.closest && e.target.closest('[data-card]'); if (c) { e.dataTransfer.setData('text/plain', c.dataset.card); e.dataTransfer.effectAllowed = 'move'; } });
+document.addEventListener('dragover', e => { const c = e.target.closest && e.target.closest('[data-col]'); if (c) { e.preventDefault(); $$('.col.over').forEach(x => x !== c && x.classList.remove('over')); c.classList.add('over'); } });
+document.addEventListener('drop', e => {
+  const c = e.target.closest && e.target.closest('[data-col]'); if (!c) return; e.preventDefault();
+  const t = I.byId.get(e.dataTransfer.getData('text/plain')); if (t && t.status !== c.dataset.col) commit(`${t.wbs} → ${c.dataset.col}`, () => setField(t, 'status', c.dataset.col));
+});
+document.addEventListener('dragend', () => $$('.col.over').forEach(x => x.classList.remove('over')));
+window.addEventListener('resize', () => { if (UI.tab === 'gantt' && UI.zoom === 'Fit') renderGantt(); });
+
+/* ---------- boot ---------- */
+try { const u = JSON.parse(localStorage.getItem(UI_KEY) || '{}'); ['tab', 'zoom', 'colorBy', 'links', 'labels', 'base', 'welcome'].forEach(k => { if (u[k] !== undefined) UI[k] = u[k]; }); if (u.theme) document.documentElement.dataset.theme = u.theme; if (!VIEWS[UI.tab]) UI.tab = 'summary'; } catch (e) { /* defaults */ }
+const hadLocal = load();
+setLevel(UI.level);
+renderAll();
+setSaved(hadLocal ? 'Restored from this browser' : 'Plan loaded from ' + (P.meta.source || 'workbook'));
+checkPublished();
+window.__planner = { get P() { return P; }, get I() { return I; }, healthChecks, planStats, drivingChain, propagate, linkError };
+})();
