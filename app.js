@@ -834,18 +834,28 @@ function viewWorkload() {
     while (d.getTime() / 864e5 <= d2n(S.finish)) { const a = d.getTime() / 864e5, nx = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 3, 1)); periods.push({ a, b: nx.getTime() / 864e5 - 1, l: `Q${d.getUTCMonth() / 3 + 1} ${String(d.getUTCFullYear()).slice(2)}` }); d = nx; }
   }
   const NONE = '(Unassigned)';
-  const heat = (key, title, stacked) => {
-    const groups = uniq(ls.map(t => t[key])); if (ls.some(t => !t[key])) groups.push(NONE); // unassigned goes last
-    const data = groups.map(g => periods.map(p => ls.filter(t => (t[key] || NONE) === g && t.status !== 'Done' && d2n(t.start) <= p.b && d2n(t.end) >= p.a).length));
-    const max = Math.max(1, ...data.filter((_, i) => groups[i] !== NONE || groups.length === 1).flat()); // a large unassigned row must not wash out the rest
+  const NO_OWNER = '(No task owner)';
+  const counts = list => periods.map(p => list.filter(t => t.status !== 'Done' && d2n(t.start) <= p.b && d2n(t.end) >= p.a).length);
+  const heat = (key, title, stacked, sectionBy) => {
+    const secName = t => t[sectionBy] || NO_OWNER;
+    const names = sectionBy ? [...uniq(ls.map(t => t[sectionBy])), ...(ls.some(t => !t[sectionBy]) ? [NO_OWNER] : [])] : [''];
+    const sections = names.map(name => {
+      const list = sectionBy ? ls.filter(t => secName(t) === name) : ls;
+      const groups = uniq(list.map(t => t[key])); if (list.some(t => !t[key])) groups.push(NONE); // unassigned goes last
+      return { name, total: counts(list), rows: groups.map(g => ({ g, vals: counts(list.filter(t => (t[key] || NONE) === g)) })) };
+    });
+    const rows = sections.flatMap(s => s.rows), named = rows.filter(r => r.g !== NONE);
+    const max = Math.max(1, ...(named.length ? named : rows).flatMap(r => r.vals)); // a large unassigned row must not wash out the rest
+    const row = (s, r) => { const who = (s.name ? s.name + ' · ' : '') + r.g; return `<tr><td class="${s.name ? 'wl-sub' : ''}" data-tip="${esc(who)}">${esc(r.g)}</td>${r.vals.map((v, j) => `<td style="background:${v ? `color-mix(in srgb,var(--s1) ${Math.round(8 + 62 * Math.min(1, v / max))}%,transparent)` : 'transparent'}" data-tip="${esc(who)}\n${periods[j].l}: ${v} open task${v === 1 ? '' : 's'}">${v || ''}</td>`).join('')}</tr>`; };
+    const head = s => (s.name ? `<tr class="wl-sec"><td data-tip="${esc(s.name)}: all open tasks">${esc(s.name)}</td>${s.total.map(v => `<td>${v || ''}</td>`).join('')}</tr>` : '');
     return `<h3 class="wl-t">${title}</h3><div class="scroll" data-scroll="wl-${key}"${stacked ? ' style="max-height:none"' : ''}><table class="heat"><thead><tr><th>Open tasks active in period</th>${periods.map(p => `<th>${p.l}</th>`).join('')}</tr></thead><tbody>
-    ${groups.map((g, i) => `<tr><td data-tip="${esc(g)}">${esc(g)}</td>${data[i].map((v, j) => `<td style="background:${v ? `color-mix(in srgb,var(--s1) ${Math.round(8 + 62 * Math.min(1, v / max))}%,transparent)` : 'transparent'}" data-tip="${esc(g)}\n${periods[j].l}: ${v} open task${v === 1 ? '' : 's'}">${v || ''}</td>`).join('')}</tr>`).join('') || `<tr><td>No tasks match.</td></tr>`}
-    </tbody></table></div><div class="legend" style="margin-top:6px"><span>Darker = more open tasks at the same time (busiest assigned cell: ${max}).</span></div>`;
+    ${rows.length ? sections.map(s => head(s) + s.rows.map(r => row(s, r)).join('')).join('') : `<tr><td>No tasks match.</td></tr>`}
+    </tbody></table></div><div class="legend" style="margin-top:6px"><span>Darker = more open tasks at the same time (busiest assigned cell: ${max}).${sectionBy ? ' Bold rows are the total for each task owner.' : ''}</span></div>`;
   };
   const both = UI.wlBy === 'both';
-  const LABEL = { owner: 'By task owner', role: 'By assigned role', other: 'By other participant' };
+  const LABEL = { owner: 'By task owner', role: 'By assigned role, within each task owner', other: 'By other participant' };
   return `<div class="bar-tools">${filterBar(`<label>Show <select data-act-change="wlBy">${[['both', 'Owner and role'], ['owner', 'Task owner'], ['role', 'Assigned role'], ['other', 'Other participant']].map(([v, l]) => opt(v, UI.wlBy, l)).join('')}</select></label><label>Period <select data-act-change="wlUnit">${[['month', 'Next 24 months'], ['quarter', 'Quarters (whole plan)']].map(([v, l]) => opt(v, UI.wlUnit, l)).join('')}</select></label>`, false)}</div>
-  ${(both ? ['owner', 'role'] : [UI.wlBy]).map(k => heat(k, LABEL[k], both)).join('')}`;
+  ${(both ? ['owner', 'role'] : [UI.wlBy]).map(k => heat(k, LABEL[k], both, k === 'role' ? 'owner' : '')).join('')}`;
 }
 function viewRisks() {
   const rs = P.risks;

@@ -203,6 +203,8 @@ td.late{color:var(--danger);font-weight:600}
 .heat td,.heat th{text-align:center;padding:4px 5px;font-size:12px}
 .heat td:first-child,.heat th:first-child{text-align:left;position:sticky;left:0;background:var(--card);z-index:2;white-space:nowrap;max-width:230px;overflow:hidden;text-overflow:ellipsis}
 .heat th:first-child{z-index:4;background:var(--card2)}
+.heat tr.wl-sec td{background:var(--card2);font-weight:600}
+.heat td.wl-sub:first-child{padding-left:20px}
 .heat tbody tr:hover td{background:revert-layer}
 
 /* health */

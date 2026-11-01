@@ -14,7 +14,7 @@ Seed data: `NSDI_Geoportal_Task_Breakdown_V11_01112026.xlsx`.
 | Milestones | Milestone list with countdown, baseline variance and add/complete actions |
 | Board | Kanban by status with drag and drop |
 | Resources | Teams, roles and people that fill the owner, role and participant dropdowns; add, rename, merge or delete |
-| Workload | Open tasks by owner and by assigned role side by side, or by participant, by month or quarter |
+| Workload | Open tasks by owner and by assigned role within each owner, or by participant, by month or quarter |
 | Risks & Issues | Risk, issue, action and decision log with scoring |
 | Plan Health | Automatic checks: overdue, conflicts, duplicates, missing owners, past project end |
 | Settings | Project details, holidays, auto-scheduling, baseline, reset, activity log |
