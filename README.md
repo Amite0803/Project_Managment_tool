@@ -1,6 +1,6 @@
 # NSDI Geoportal Planner
 
-A browser-based task and timeline manager for the NSDI & Geoportal project. It needs no install, no server and no account. Open `index.html`, or use the GitHub Pages link.
+A browser-based task and timeline manager for the NSDI & Geoportal project. It needs no install and no server. Open `index.html`, or use the GitHub Pages link. Viewing needs no account; saving to the shared plan needs a GitHub account with write access.
 
 Seed data: `NSDI_Geoportal_Task_Breakdown_V11_01112026.xlsx`.
 
@@ -23,9 +23,21 @@ Also included: undo/redo, autosave, Excel import and export, project files, prin
 
 ## Saving and sharing
 
-- Edits save in the browser you made them in. Other people do not see them automatically.
-- **To update everyone:** use *File › Save project file*, rename the file `project.json`, and upload it to the root of this repository. Visitors are prompted to load the newer plan.
+- Edits save automatically in the browser you made them in. Other people do not see them until you save to GitHub.
+- **To update everyone:** click **☁ Save to GitHub**. This writes the plan to `project.json` in this repository, and GitHub keeps every earlier version.
+- **To get the latest plan:** open or reload the tool. It loads automatically if you have no unsaved changes; otherwise a banner lets you load it or keep your copy. It does not update while the page is open.
+- **If someone saved first:** your save is blocked so their work is not overwritten. Download your copy if you want it for reference, load the newer plan, redo your changes and save again.
 - **To send one person a copy:** send the project file or the Excel export.
+
+### Setting up an editor
+
+Anyone can view the plan. To save, each editor connects once in each browser:
+
+1. **Repository owner:** add the editor under *Settings › Collaborators*. The editor accepts the invitation.
+2. **Create a token.** The tool's *Save to GitHub* dialog links to the right page:
+   - Owner: a fine-grained token limited to this repository, with Contents set to read and write.
+   - Collaborator: a classic token with only the `public_repo` scope, because GitHub does not support fine-grained tokens for collaborators. This token can write to every public repository the collaborator's account can write to.
+3. **Paste the token** into the dialog. It stays in that browser and is never included in the plan or in exports. On a shared computer, untick "Remember it" so it is dropped when the page closes. Use *Disconnect* in the dialog to remove a remembered token.
 
 ## How the plan is calculated
 

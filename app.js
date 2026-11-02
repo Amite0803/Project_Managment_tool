@@ -205,11 +205,20 @@ function drivingChain(target) {
 }
 
 /* ---------- persistence ---------- */
-function save() {
+let dirty = false; // this browser has edits that are not in the shared plan on GitHub
+try { dirty = localStorage.getItem(KEY + '-dirty') === '1'; } catch (e) { /* optional */ }
+const clock = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function setDirty(v) {
+  dirty = v;
+  try { if (v) localStorage.setItem(KEY + '-dirty', '1'); else localStorage.removeItem(KEY + '-dirty'); } catch (e) { /* optional */ }
+  $('#ghBtn').classList.toggle('pri', v);
+}
+function persist() {
   P.meta.savedAt = new Date().toISOString();
-  try { localStorage.setItem(KEY, JSON.stringify(P)); setSaved('Saved in this browser · ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })); }
+  try { localStorage.setItem(KEY, JSON.stringify(P)); setSaved('Saved in this browser · ' + clock() + (dirty ? ' · not on GitHub yet' : '')); }
   catch (e) { setSaved('⚠ Could not save in this browser – use File › Save project file'); }
 }
+function save() { setDirty(true); persist(); }
 function setSaved(t) { $('#saveState').textContent = t; }
 function saveUI() { try { localStorage.setItem(UI_KEY, JSON.stringify({ tab: UI.tab, zoom: UI.zoom, colorBy: UI.colorBy, links: UI.links, labels: UI.labels, base: UI.base, welcome: UI.welcome, theme: document.documentElement.dataset.theme || '' })); } catch (e) { /* optional */ } }
 function validProject(p) {
@@ -995,7 +1004,7 @@ function dlgHelp() {
   <li><b>Add dependencies:</b> hover a bar and drag the ○ onto the next task, or use Manage dependencies. Types: FS, SS, FF, SF, with lag in workdays.</li>
   <li><b>Milestones:</b> use ◆ Add milestone, or tick “Mark as a milestone” on any task.</li>
   <li><b>Auto-scheduling:</b> when a task moves, the tasks that depend on it are pushed later if needed. Turn this off in Settings.</li>
-  <li><b>Saving:</b> changes stay in this browser. To pass them on, use File › Save project file and send it, or File › Export to Excel.</li>
+  <li><b>Saving:</b> changes save in this browser automatically. Use ☁ Save to GitHub to share them; others get them the next time they open or reload the tool.</li>
   <li><b>Undo:</b> Ctrl+Z and Ctrl+Y.</li></ul>`);
 }
 function dlgShare() {
@@ -1003,13 +1012,106 @@ function dlgShare() {
   dialog('🔗 Share this plan', `<p class="ink2" style="margin-top:0">${onWeb ? 'Anyone with this link can open the plan:' : 'This copy is running from your computer. The online link is available once it is published.'}</p>
   ${onWeb ? `<input id="shareUrl" readonly value="${esc(url)}" style="width:100%"><div style="margin:8px 0 12px"><button type="button" class="btn sm" data-act="copyUrl">📋 Copy link</button></div>` : ''}
   <div class="section-t">How edits are shared</div><ul class="help ink2" style="padding-left:18px;margin:0">
-  <li>Each person's edits stay in their own browser until shared.</li>
-  <li><b>To update everyone:</b> use File › Save project file, name it <code>project.json</code>, and upload it to the GitHub repository. Visitors then get a prompt to load the newer plan.</li>
+  <li>Each person's edits stay in their own browser until they use <b>☁ Save to GitHub</b>.</li>
+  <li>Everyone else gets the saved plan the next time they open or reload the tool. It does not appear while they have the page open.</li>
+  <li>If someone else saved first, GitHub blocks your save so their work is not overwritten. You load their plan and redo your changes.</li>
   <li><b>To send one person a copy:</b> email the project file; they use File › Open project file.</li></ul>`);
 }
 
+/* ---------- shared plan on GitHub ---------- */
+const GH_API = 'https://api.github.com', GH_REPO = '/repos/Amite0803/Project_Managment_tool', GH_FILE = 'project.json', GH_BRANCH = 'main';
+const GH_FINE = 'https://github.com/settings/personal-access-tokens/new?name=NSDI+Planner&description=Save+the+NSDI+plan&target_name=Amite0803&expires_in=90&contents=write';
+const GH_CLASSIC = 'https://github.com/settings/tokens/new?scopes=public_repo&description=NSDI+Planner';
+let ghToken = '', ghUser = '', ghBusy = false;
+try { const g = JSON.parse(localStorage.getItem(KEY + '-gh') || 'null'); if (g) { ghToken = g.token; ghUser = g.user; } } catch (e) { /* optional */ }
+function ghReq(path, opts = {}, token = ghToken) {
+  const headers = Object.assign({ Accept: 'application/vnd.github+json' }, token ? { Authorization: 'Bearer ' + token } : {}, opts.headers);
+  return fetch(GH_API + path, Object.assign({ cache: 'no-store' }, opts, { headers }));
+}
+const ghForget = () => { ghToken = ''; ghUser = ''; try { localStorage.removeItem(KEY + '-gh'); } catch (e) { /* optional */ } };
+const getPub = () => { try { return localStorage.getItem(KEY + '-pub') || ''; } catch (e) { return ''; } };
+const setPub = v => { try { localStorage.setItem(KEY + '-pub', v); } catch (e) { /* optional */ } };
+function b64enc(s) { const b = new TextEncoder().encode(s); let o = ''; for (let i = 0; i < b.length; i += 0x8000) o += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(o); }
+const b64dec = s => new TextDecoder().decode(Uint8Array.from(atob(s.replace(/\s/g, '')), c => c.charCodeAt(0)));
+function sharedInfo(obj, sha) {
+  const p = obj && (obj.project || obj);
+  return validProject(p) ? { obj, sha, pub: obj.savedAt || (p.meta && p.meta.savedAt) || '', by: obj.savedBy || 'Someone' } : { obj: null, sha, pub: '', by: '' };
+}
+async function fetchShared() { // null when nothing has been saved yet
+  const r = await ghReq(`${GH_REPO}/contents/${GH_FILE}?ref=${GH_BRANCH}`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw Object.assign(new Error('GitHub ' + r.status), { status: r.status });
+  const j = await r.json();
+  let c = j.content;
+  if (!c) { // files over 1 MB come back without their content
+    const b = await ghReq(`${GH_REPO}/git/blobs/${j.sha}`);
+    if (!b.ok) throw Object.assign(new Error('GitHub ' + b.status), { status: b.status });
+    c = (await b.json()).content;
+  }
+  let obj = null; try { obj = JSON.parse(b64dec(c)); } catch (e) { /* unreadable: can be replaced by the next save */ }
+  return sharedInfo(obj, j.sha);
+}
+function takeShared(sh) {
+  if (!loadProjectObject(sh.obj, 'shared plan')) return;
+  setPub(sh.pub); setDirty(false); persist(); $('#banner').innerHTML = '';
+}
+function dlgGhConnect(msg) {
+  dialog('☁ Connect to GitHub', `${msg ? `<p style="margin-top:0;color:var(--danger)">${esc(msg)}</p>` : ''}<p class="ink2" style="margin-top:0">Saving needs a GitHub account with write access to this plan's repository, and an access token. You do this once in each browser.</p>
+  <ul class="help ink2" style="padding-left:18px">
+  <li><b>Repository owner:</b> create a <a href="${GH_FINE}" target="_blank" rel="noopener">fine-grained token</a>. Under repository access, select only <code>Project_Managment_tool</code>. Contents should be “Read and write”.</li>
+  <li><b>Invited collaborator:</b> accept the invitation, then create a <a href="${GH_CLASSIC}" target="_blank" rel="noopener">classic token</a> with only the <code>public_repo</code> scope. GitHub does not let collaborators use fine-grained tokens. This token can write to every public repository your account can write to, so keep it private.</li></ul>
+  <div class="form"><label class="full">Paste the token here<input type="password" name="token" required autocomplete="off" spellcheck="false"></label>
+  <label class="full" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" name="remember" checked style="width:auto"> Remember it in this browser (untick on a shared computer)</label></div>
+  <p id="ghErr" role="alert" style="margin:10px 0 0;color:var(--danger)"></p>`, fd => {
+    const token = String(fd.get('token')).trim(), remember = !!fd.get('remember'), err = $('#ghErr');
+    err.textContent = 'Checking…';
+    (async () => {
+      const u = await ghReq('/user', {}, token);
+      if (!u.ok) { err.textContent = u.status === 401 ? 'GitHub did not accept that token. Check that it was copied in full and has not expired.' : `GitHub returned an error (${u.status}). Try again.`; return; }
+      const login = (await u.json()).login, rp = await ghReq(GH_REPO, {}, token), repo = rp.ok ? await rp.json() : {};
+      if (repo.permissions && repo.permissions.push === false) { err.textContent = `The account ${login} does not have write access to this repository. Ask the owner to add it as a collaborator, then accept the invitation.`; return; }
+      ghToken = token; ghUser = login;
+      if (remember) { try { localStorage.setItem(KEY + '-gh', JSON.stringify({ token, user: login })); } catch (e) { /* kept for this visit only */ } }
+      $('#modal').close(); dlgGhSave();
+    })().catch(() => { err.textContent = 'Could not reach GitHub. Check your connection and try again.'; });
+    return false;
+  }, 'Connect');
+}
+function dlgGhSave() {
+  dialog('☁ Save to GitHub', `<p class="ink2" style="margin-top:0">This replaces the shared plan with your copy. Everyone gets it the next time they open or reload the tool, and GitHub keeps the earlier versions.</p>
+  <div class="form"><label class="full">What changed (optional)<input name="note" maxlength="120" placeholder="e.g. Updated start dates for stage 2"></label></div>
+  <p class="ink2" style="margin:10px 0 0">Connected as <b>${esc(ghUser)}</b> · <button type="button" class="btn sm" data-act="ghDisconnect">Disconnect</button></p>`, fd => { pushPlan(String(fd.get('note') || '').trim()); }, 'Save to GitHub');
+}
+function dlgGhConflict(sh) {
+  setSaved('Not saved to GitHub · a newer plan is there');
+  dialog('⚠ Someone saved first', `<p style="margin-top:0"><b>${esc(sh.by)}</b> saved the shared plan on ${esc(new Date(sh.pub).toLocaleString())}, after your copy was last updated from GitHub. Your changes were not sent, so their work is safe.</p>
+  <p class="ink2">Your changes are still in this browser. To continue, load the newer plan, redo your changes, and save again. Download your copy first so you can check what you changed.</p>
+  <button type="button" class="btn" data-act="saveJson">💾 Download my copy</button>`, () => takeShared(sh), 'Load newer plan (replaces mine)');
+}
+async function pushPlan(note) {
+  ghBusy = true; setSaved('Saving to GitHub…');
+  try {
+    persist();
+    const at = P.meta.savedAt, body = planFile({ savedBy: ghUser });
+    const sh = await fetchShared();
+    if (sh && sh.obj && sh.pub !== getPub()) return dlgGhConflict(sh);
+    const r = await ghReq(`${GH_REPO}/contents/${GH_FILE}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ message: note ? 'Update plan: ' + note : 'Update plan', content: b64enc(body), branch: GH_BRANCH }, sh ? { sha: sh.sha } : {})) });
+    if (r.status === 409 || r.status === 422) { const latest = await fetchShared(); if (latest && latest.obj) return dlgGhConflict(latest); }
+    if (!r.ok) throw Object.assign(new Error('GitHub ' + r.status), { status: r.status });
+    setPub(at);
+    if (P.meta.savedAt === at) { setDirty(false); setSaved('Saved to GitHub · ' + clock()); } else setSaved('Saved to GitHub · newer edits are not on GitHub yet');
+    toast('Saved to GitHub');
+  } catch (e) {
+    setSaved('Saved in this browser · not on GitHub yet');
+    if (e.status === 401) { ghForget(); dlgGhConnect('GitHub no longer accepts your token. It may have expired. Create a new one to save. Your changes are still in this browser.'); }
+    else if (e.status === 403 || e.status === 404) { ghForget(); dlgGhConnect('GitHub refused the save. This token or account does not have write access to the repository. Your changes are still in this browser.'); }
+    else toast('Could not save to GitHub. Your changes are still in this browser.', 1);
+  } finally { ghBusy = false; }
+}
+
 /* ---------- import / export ---------- */
-function exportJson() { save(); download(`NSDI_Plan_${stamp()}.json`, new Blob([JSON.stringify({ app: 'nsdi-planner', version: 1, savedAt: P.meta.savedAt, project: P }, null, 1)], { type: 'application/json' })); toast('Project file saved'); }
+const planFile = extra => JSON.stringify(Object.assign({ app: 'nsdi-planner', version: 1, savedAt: P.meta.savedAt }, extra, { project: P }), null, 1);
+function exportJson() { persist(); download(`NSDI_Plan_${stamp()}.json`, new Blob([planFile()], { type: 'application/json' })); toast('Project file saved'); }
 function loadProjectObject(obj, name) {
   const p = obj && obj.project ? obj.project : obj;
   if (!validProject(p)) { toast('That file is not a valid project file', 1); return false; }
@@ -1068,18 +1170,16 @@ function importWorkbook(buf, name) {
 }
 function checkPublished() {
   if (!/^https?:/.test(location.protocol)) return;
-  fetch('project.json', { cache: 'no-store' }).then(r => (r.ok ? r.json() : null)).then(obj => {
-    if (!obj) return;
-    const p = obj.project || obj; if (!validProject(p)) return;
-    const pub = obj.savedAt || (p.meta && p.meta.savedAt) || '';
-    let seen = ''; try { seen = localStorage.getItem(KEY + '-pub') || ''; } catch (e) { /* optional */ }
-    if (pub <= seen) return;
-    const accept = () => { try { localStorage.setItem(KEY + '-pub', pub); } catch (e) { /* optional */ } };
-    if (!hadLocal) { accept(); adopt(p); setLevel(UI.level); renderAll(); return; }
-    $('#banner').innerHTML = `<div><span>📬 A newer shared plan was published on ${esc(new Date(pub).toLocaleString())}.</span><span><button class="btn sm pri" id="pubLoad">Load it (replaces my copy)</button> <button class="btn sm" id="pubSkip">Keep mine</button></span></div>`;
-    $('#pubLoad').onclick = () => { accept(); $('#banner').innerHTML = ''; loadProjectObject(obj, 'published plan'); };
-    $('#pubSkip').onclick = () => { accept(); $('#banner').innerHTML = ''; };
-  }).catch(() => { /* no published plan */ });
+  // The GitHub API has the latest version straight away; the Pages copy can lag by minutes, so it is only a fallback (for example when the API rate limit is reached)
+  fetchShared().catch(() => fetch(GH_FILE, { cache: 'no-store' }).then(r => (r.ok ? r.json() : null)).then(o => (o ? sharedInfo(o, '') : null))).then(sh => {
+    if (!sh || !sh.obj) return;
+    const seen = getPub();
+    if (sh.sha ? sh.pub === seen : sh.pub <= seen) return;
+    if (!dirty) { adopt(sh.obj.project || sh.obj); setLevel(UI.level); setPub(sh.pub); persist(); renderAll(); setSaved('Latest shared plan loaded · saved by ' + sh.by); return; }
+    $('#banner').innerHTML = `<div><span>📬 ${esc(sh.by)} saved a newer shared plan on ${esc(new Date(sh.pub).toLocaleString())}. Your copy has changes that are not on GitHub.</span><span><button class="btn sm pri" id="pubLoad">Load it (replaces my copy)</button> <button class="btn sm" id="pubSkip">Keep mine for now</button></span></div>`;
+    $('#pubLoad').onclick = () => takeShared(sh);
+    $('#pubSkip').onclick = () => { $('#banner').innerHTML = ''; };
+  }).catch(() => { /* no shared plan */ });
 }
 
 /* ---------- events ---------- */
@@ -1089,6 +1189,13 @@ const ACTIONS = {
   theme: () => { const r = document.documentElement, dark = r.dataset.theme ? r.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; r.dataset.theme = dark ? 'light' : 'dark'; saveUI(); },
   help: dlgHelp, share: dlgShare,
   copyUrl: () => { const u = $('#shareUrl'); (navigator.clipboard ? navigator.clipboard.writeText(u.value) : Promise.reject()).then(() => toast('Link copied'), () => { u.select(); toast('Press Ctrl+C to copy'); }); },
+  ghSave: () => {
+    if (ghBusy) return;
+    if (!ghToken) return dlgGhConnect();
+    if (!dirty && getPub()) return toast('No changes to save since your last update from GitHub');
+    dlgGhSave();
+  },
+  ghDisconnect: () => { ghForget(); $('#modal').close(); toast('Disconnected from GitHub in this browser'); },
   saveJson: exportJson, exportXlsx,
   loadJson: () => $('#fileJson').click(),
   importXlsx: () => $('#fileXlsx').click(),
@@ -1254,7 +1361,8 @@ try { const u = JSON.parse(localStorage.getItem(UI_KEY) || '{}'); ['tab', 'zoom'
 const hadLocal = load();
 setLevel(UI.level);
 renderAll();
-setSaved(hadLocal ? 'Restored from this browser' : 'Plan loaded from ' + (P.meta.source || 'workbook'));
+setDirty(dirty || (hadLocal && !getPub())); // copies edited before this feature count as unsaved
+setSaved(hadLocal ? 'Restored from this browser' + (dirty ? ' · not on GitHub yet' : '') : 'Plan loaded from ' + (P.meta.source || 'workbook'));
 checkPublished();
-window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError };
+window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError, checkPublished };
 })();
