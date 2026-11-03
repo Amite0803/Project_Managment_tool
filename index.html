@@ -14,7 +14,7 @@
   <div class="top-actions">
     <button class="btn icon" data-act="undo" data-tip="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
     <button class="btn icon" data-act="redo" data-tip="Redo (Ctrl+Y)" aria-label="Redo">↷</button>
-    <button class="btn" id="ghBtn" data-act="ghSave" data-tip="Save your changes to the shared plan on GitHub">☁ Save to GitHub</button>
+    <button class="btn" id="authBtn" data-act="account" hidden>👤 Sign in to edit</button>
     <details class="menu">
       <summary class="btn">📁 File</summary>
       <div class="menu-pop">
@@ -41,6 +41,9 @@
 <div id="tip" role="tooltip" hidden></div>
 <input type="file" id="fileJson" accept=".json,application/json" hidden>
 <input type="file" id="fileXlsx" accept=".xlsx,.xlsm" hidden>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js" defer></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js" defer></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js" defer></script>
 <script src="lib/xlsx.full.min.js" defer></script>
 <script src="data.js" defer></script>
 <script src="app.js" defer></script>

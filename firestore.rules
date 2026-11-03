@@ -1,0 +1,23 @@
+// Paste into Firebase console › Firestore Database › Rules, with OWNER_EMAIL replaced by the owner's address.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function confirmed() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    function isOwner() {
+      return confirmed() && request.auth.token.email == 'OWNER_EMAIL';
+    }
+    function isEditor() {
+      return isOwner() || (confirmed() && exists(/databases/$(database)/documents/editors/$(request.auth.token.email)));
+    }
+    match /plan/{doc} {
+      allow read: if true;
+      allow write: if isEditor();
+    }
+    match /editors/{email} {
+      allow read: if isOwner() || (confirmed() && request.auth.token.email == email);
+      allow write: if isOwner();
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # NSDI Geoportal Planner
 
-A browser-based task and timeline manager for the NSDI & Geoportal project. It needs no install and no server. Open `index.html`, or use the GitHub Pages link. Viewing needs no account; saving to the shared plan needs a GitHub account with write access.
+A browser-based task and timeline manager for the NSDI & Geoportal project. It needs no install. Use the GitHub Pages link. Viewing needs no account; editors sign in with an email and password.
 
 Seed data: `NSDI_Geoportal_Task_Breakdown_V11_01112026.xlsx`.
 
@@ -23,21 +23,29 @@ Also included: undo/redo, autosave, Excel import and export, project files, prin
 
 ## Saving and sharing
 
-- Edits save automatically in the browser you made them in. Other people do not see them until you save to GitHub.
-- **To update everyone:** click **☁ Save to GitHub**. This writes the plan to `project.json` in this repository, and GitHub keeps every earlier version.
-- **To get the latest plan:** open or reload the tool. It loads automatically if you have no unsaved changes; otherwise a banner lets you load it or keep your copy. It does not update while the page is open.
-- **If someone saved first:** your save is blocked so their work is not overwritten. Download your copy if you want it for reference, load the newer plan, redo your changes and save again.
-- **To send one person a copy:** send the project file or the Excel export.
+The plan lives in a Firebase Firestore database, and the tool itself is hosted on GitHub Pages.
 
-### Setting up an editor
+- **Viewing:** anyone with the link can view the plan. No account is needed.
+- **Editing:** changes save automatically and reach everyone within seconds.
+- **Two people at once:** changes to different fields are all kept, even on the same task. If two people change the same field, the last change wins.
+- **Undo:** undo history is cleared when someone else's change arrives, so an undo cannot overwrite newer work.
+- **Backups:** the free Firebase plan has no automatic backups. Use *File › Save project file* regularly. To restore, use *File › Open project file*, which replaces the shared plan for everyone.
+- **To send someone a copy:** send the project file or the Excel export.
 
-Anyone can view the plan. To save, each editor connects once in each browser:
+### Adding an editor
 
-1. **Repository owner:** add the editor under *Settings › Collaborators*. The editor accepts the invitation.
-2. **Create a token.** The tool's *Save to GitHub* dialog links to the right page:
-   - Owner: a fine-grained token limited to this repository, with Contents set to read and write.
-   - Collaborator: a classic token with only the `public_repo` scope, because GitHub does not support fine-grained tokens for collaborators. This token can write to every public repository the collaborator's account can write to.
-3. **Paste the token** into the dialog. It stays in that browser and is never included in the plan or in exports. On a shared computer, untick "Remember it" so it is dropped when the page closes. Use *Disconnect* in the dialog to remove a remembered token.
+1. **Owner:** click your name at the top, enter the editor's email and click *Add editor*.
+2. **Editor:** open the link, click *Sign in to edit*, then *Create an account* with that same email.
+3. **Editor:** click the link in the confirmation email, then *I've confirmed it*.
+
+Editors stay signed in on that browser. To remove someone, the owner clicks *Remove* next to their email.
+
+### Privacy and setup
+
+- The activity log shows the part of each editor's email before the @, and anyone with the link can read it. Full addresses on the editors list are visible only to the owner; each editor can check only their own.
+- `app.js` holds the Firebase web config. It identifies the project and is not a secret. `firestore.rules` holds the access rules; paste it into *Firestore Database › Rules* in the Firebase console, with `OWNER_EMAIL` replaced by the owner's address.
+- The original workbook data (`data.js`) stays public in this repository.
+- If the database cannot be reached, for example if the Firebase scripts are blocked, the tool falls back to the copy in that browser.
 
 ## How the plan is calculated
 
@@ -53,4 +61,4 @@ Anyone can view the plan. To save, each editor connects once in each browser:
 
 ## Files
 
-`index.html`, `app.css`, `app.js`, `data.js` (seed data), `lib/xlsx.full.min.js` (SheetJS, for Excel).
+`index.html`, `app.css`, `app.js`, `firestore.rules` (database access rules), `data.js` (seed data), `lib/xlsx.full.min.js` (SheetJS, for Excel).

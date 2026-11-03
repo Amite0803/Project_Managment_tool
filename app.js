@@ -205,20 +205,13 @@ function drivingChain(target) {
 }
 
 /* ---------- persistence ---------- */
-let dirty = false; // this browser has edits that are not in the shared plan on GitHub
-try { dirty = localStorage.getItem(KEY + '-dirty') === '1'; } catch (e) { /* optional */ }
 const clock = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-function setDirty(v) {
-  dirty = v;
-  try { if (v) localStorage.setItem(KEY + '-dirty', '1'); else localStorage.removeItem(KEY + '-dirty'); } catch (e) { /* optional */ }
-  $('#ghBtn').classList.toggle('pri', v);
-}
-function persist() {
+function persist() { // this browser's copy opens the tool quickly; with live sync on, the shared plan is the master
   P.meta.savedAt = new Date().toISOString();
-  try { localStorage.setItem(KEY, JSON.stringify(P)); setSaved('Saved in this browser · ' + clock() + (dirty ? ' · not on GitHub yet' : '')); }
-  catch (e) { setSaved('⚠ Could not save in this browser – use File › Save project file'); }
+  try { localStorage.setItem(KEY, JSON.stringify(P)); if (!Live.on) setSaved('Saved in this browser · ' + clock()); }
+  catch (e) { if (!Live.on) setSaved('⚠ Could not save in this browser – use File › Save project file'); }
 }
-function save() { setDirty(true); persist(); }
+function save() { persist(); pushChanges(); }
 function setSaved(t) { $('#saveState').textContent = t; }
 function saveUI() { try { localStorage.setItem(UI_KEY, JSON.stringify({ tab: UI.tab, zoom: UI.zoom, colorBy: UI.colorBy, links: UI.links, labels: UI.labels, base: UI.base, welcome: UI.welcome, theme: document.documentElement.dataset.theme || '' })); } catch (e) { /* optional */ } }
 function validProject(p) {
@@ -245,8 +238,14 @@ function load() {
   return false;
 }
 const snapshot = () => JSON.stringify({ tasks: P.tasks, risks: P.risks, resources: P.resources, meta: P.meta, settings: P.settings, baseline: P.baseline });
-function logIt(label) { P.log.unshift({ at: new Date().toISOString(), what: label }); P.log.length = Math.min(P.log.length, 200); }
+function logIt(label) { P.log.unshift(Object.assign({ at: new Date().toISOString(), what: label }, Live.user ? { by: Live.user.email.split('@')[0] } : {})); P.log.length = Math.min(P.log.length, 200); }
+function viewOnly() {
+  if (!Live.on || Live.canEdit) return false;
+  toast(Live.user ? 'Your account cannot edit yet. Click your name at the top for details.' : 'This is view only. Use “Sign in to edit” to make changes.', 1);
+  return true;
+}
 function commit(label, fn) {
+  if (viewOnly()) { renderAll(); return false; }
   const snapShot = snapshot();
   if (fn() === false) { Object.assign(P, JSON.parse(snapShot)); index(); rollup(); renderAll(); return false; }
   undoStack.push(snapShot); if (undoStack.length > 40) undoStack.shift(); redoStack = [];
@@ -917,7 +916,7 @@ function viewSettings() {
   </div><p class="muted" style="font-size:12.5px;margin:8px 0 0">The workbook counts no holidays, so none are set. Adding them only affects tasks you change afterwards.</p></div>
   <div class="card"><h3>Baseline</h3><p class="ink2" style="margin-top:0">Current baseline: <b>${esc((P.baseline && P.baseline.label) || 'none')}</b>${P.baseline ? ` · ${fmt(P.baseline.savedAt.slice(0, 10))}` : ''}. Compare against it on the Gantt and Milestones tabs.</p><button class="btn" data-act="setBaseline">📐 Save current plan as baseline</button></div>
   <div class="card"><h3>Start over</h3><p class="ink2" style="margin-top:0">Replace all changes in this browser with the plan as first published. Save a project file first if you want a copy.</p><button class="btn danger" data-act="resetPlan">↺ Reset to original plan</button></div>
-  <div class="card" style="grid-column:1/-1"><h3>Activity log</h3><div style="max-height:320px;overflow:auto">${P.log.map(l => `<div class="mini-row" style="cursor:default"><span>${esc(l.what)}</span><span class="muted nowrap">${esc(new Date(l.at).toLocaleString())}</span></div>`).join('') || '<div class="muted">Changes you make will be listed here.</div>'}</div></div>
+  <div class="card" style="grid-column:1/-1"><h3>Activity log</h3><div style="max-height:320px;overflow:auto">${P.log.map(l => `<div class="mini-row" style="cursor:default"><span>${esc(l.what)}</span><span class="muted nowrap">${l.by ? esc(l.by) + ' · ' : ''}${esc(new Date(l.at).toLocaleString())}</span></div>`).join('') || '<div class="muted">Changes you make will be listed here.</div>'}</div></div>
   </div>`;
 }
 
@@ -1004,7 +1003,8 @@ function dlgHelp() {
   <li><b>Add dependencies:</b> hover a bar and drag the ○ onto the next task, or use Manage dependencies. Types: FS, SS, FF, SF, with lag in workdays.</li>
   <li><b>Milestones:</b> use ◆ Add milestone, or tick “Mark as a milestone” on any task.</li>
   <li><b>Auto-scheduling:</b> when a task moves, the tasks that depend on it are pushed later if needed. Turn this off in Settings.</li>
-  <li><b>Saving:</b> changes save in this browser automatically. Use ☁ Save to GitHub to share them; others get them the next time they open or reload the tool.</li>
+  <li><b>Saving:</b> anyone with the link can view. Editors use “Sign in to edit”; their changes save automatically and everyone sees them within seconds.</li>
+  <li><b>Backups:</b> use File › Save project file now and then to keep a copy.</li>
   <li><b>Undo:</b> Ctrl+Z and Ctrl+Y.</li></ul>`);
 }
 function dlgShare() {
@@ -1012,101 +1012,187 @@ function dlgShare() {
   dialog('🔗 Share this plan', `<p class="ink2" style="margin-top:0">${onWeb ? 'Anyone with this link can open the plan:' : 'This copy is running from your computer. The online link is available once it is published.'}</p>
   ${onWeb ? `<input id="shareUrl" readonly value="${esc(url)}" style="width:100%"><div style="margin:8px 0 12px"><button type="button" class="btn sm" data-act="copyUrl">📋 Copy link</button></div>` : ''}
   <div class="section-t">How edits are shared</div><ul class="help ink2" style="padding-left:18px;margin:0">
-  <li>Each person's edits stay in their own browser until they use <b>☁ Save to GitHub</b>.</li>
-  <li>Everyone else gets the saved plan the next time they open or reload the tool. It does not appear while they have the page open.</li>
-  <li>If someone else saved first, GitHub blocks your save so their work is not overwritten. You load their plan and redo your changes.</li>
-  <li><b>To send one person a copy:</b> email the project file; they use File › Open project file.</li></ul>`);
+  <li>Everyone with the link sees the same plan, and it updates within seconds. Viewing needs no account.</li>
+  <li><b>To edit:</b> the owner adds your email to the editors list. You then use “Sign in to edit” and create an account with that email.</li>
+  <li>If two people change the same field, the last change wins. Changes to different fields are all kept.</li>
+  <li><b>To send someone a copy:</b> use File › Save project file or File › Export to Excel.</li></ul>`);
 }
 
-/* ---------- shared plan on GitHub ---------- */
-const GH_API = 'https://api.github.com', GH_REPO = '/repos/Amite0803/Project_Managment_tool', GH_FILE = 'project.json', GH_BRANCH = 'main';
-const GH_FINE = 'https://github.com/settings/personal-access-tokens/new?name=NSDI+Planner&description=Save+the+NSDI+plan&target_name=Amite0803&expires_in=90&contents=write';
-const GH_CLASSIC = 'https://github.com/settings/tokens/new?scopes=public_repo&description=NSDI+Planner';
-let ghToken = '', ghUser = '', ghBusy = false;
-try { const g = JSON.parse(localStorage.getItem(KEY + '-gh') || 'null'); if (g) { ghToken = g.token; ghUser = g.user; } } catch (e) { /* optional */ }
-function ghReq(path, opts = {}, token = ghToken) {
-  const headers = Object.assign({ Accept: 'application/vnd.github+json' }, token ? { Authorization: 'Bearer ' + token } : {}, opts.headers);
-  return fetch(GH_API + path, Object.assign({ cache: 'no-store' }, opts, { headers }));
+/* ---------- live shared plan (Firebase Firestore) ---------- */
+// The config identifies the project and is not a secret; the Firestore rules decide who can write.
+// Tasks are split across a fixed set of documents and written field by field, so two people editing different fields both keep their changes.
+const FB_CONFIG = { apiKey: 'AIzaSyAqVQaKmvG_89ET7HZPROALrsd5CHcUyJ0', authDomain: 'nsdi-planner.firebaseapp.com', projectId: 'nsdi-planner', storageBucket: 'nsdi-planner.firebasestorage.app', messagingSenderId: '498535724427', appId: '1:498535724427:web:91ee968eb84863997a6b8e' };
+const BUCKETS = 16;
+const Live = { on: false, db: null, auth: null, user: null, canEdit: false, isOwner: false, seeded: false, first: true, base: null, stash: null, timer: 0, saving: 0, waitTimer: 0 };
+const hashStr = s => { let h = 5381; for (const c of String(s)) h = ((h * 33) ^ c.codePointAt(0)) >>> 0; return h; };
+const canon = v => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : x));
+const wbsCmp = (a, b) => { const x = a.wbs.split('.'), y = b.wbs.split('.'); for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (i < x.length ? +x[i] : -1) - (i < y.length ? +y[i] : -1); if (d) return d; } return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; };
+const logKey = l => 'l' + String(l.at).replace(/\D/g, '') + '_' + hashStr(l.what);
+function toDocs(p) {
+  const { savedAt, ...meta } = p.meta;
+  const docs = { meta: { meta, settings: p.settings, baseline: p.baseline, stats: p.stats || {} }, risks: { items: {} }, resources: { items: {} }, log: { items: {} } };
+  for (let i = 0; i < BUCKETS; i++) docs['b' + i] = { items: {} };
+  p.tasks.forEach(t => { const { depth, ...rest } = t; docs['b' + (hashStr(t.id) % BUCKETS)].items[t.id] = rest; });
+  p.risks.forEach(r => { docs.risks.items[r.id] = r; });
+  p.resources.forEach(r => { docs.resources.items[r.id] = r; });
+  p.log.forEach(l => { docs.log.items[logKey(l)] = l; });
+  return JSON.parse(JSON.stringify(docs));
 }
-const ghForget = () => { ghToken = ''; ghUser = ''; try { localStorage.removeItem(KEY + '-gh'); } catch (e) { /* optional */ } };
-const getPub = () => { try { return localStorage.getItem(KEY + '-pub') || ''; } catch (e) { return ''; } };
-const setPub = v => { try { localStorage.setItem(KEY + '-pub', v); } catch (e) { /* optional */ } };
-function b64enc(s) { const b = new TextEncoder().encode(s); let o = ''; for (let i = 0; i < b.length; i += 0x8000) o += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(o); }
-const b64dec = s => new TextDecoder().decode(Uint8Array.from(atob(s.replace(/\s/g, '')), c => c.charCodeAt(0)));
-function sharedInfo(obj, sha) {
-  const p = obj && (obj.project || obj);
-  return validProject(p) ? { obj, sha, pub: obj.savedAt || (p.meta && p.meta.savedAt) || '', by: obj.savedBy || 'Someone' } : { obj: null, sha, pub: '', by: '' };
+function flatDoc(doc) {
+  const out = {};
+  Object.entries(doc || {}).forEach(([k, v]) => {
+    if (k === 'items') Object.entries(v || {}).forEach(([id, it]) => Object.entries(it || {}).forEach(([f, x]) => { out[`items.${id}.${f}`] = canon(x); }));
+    else if (k === 'meta' || k === 'settings') Object.entries(v || {}).forEach(([f, x]) => { out[`${k}.${f}`] = canon(x); });
+    else out[k] = canon(v);
+  });
+  return out;
 }
-async function fetchShared() { // null when nothing has been saved yet
-  const r = await ghReq(`${GH_REPO}/contents/${GH_FILE}?ref=${GH_BRANCH}`);
-  if (r.status === 404) return null;
-  if (!r.ok) throw Object.assign(new Error('GitHub ' + r.status), { status: r.status });
-  const j = await r.json();
-  let c = j.content;
-  if (!c) { // files over 1 MB come back without their content
-    const b = await ghReq(`${GH_REPO}/git/blobs/${j.sha}`);
-    if (!b.ok) throw Object.assign(new Error('GitHub ' + b.status), { status: b.status });
-    c = (await b.json()).content;
+const flatDocs = docs => Object.fromEntries(Object.entries(docs).map(([id, d]) => [id, flatDoc(d)]));
+function unflatDocs(flat) {
+  const docs = {};
+  Object.entries(flat).forEach(([id, paths]) => {
+    const d = docs[id] = {};
+    Object.entries(paths).forEach(([path, val]) => { const seg = path.split('.'); let o = d; seg.slice(0, -1).forEach(s => { o = o[s] = o[s] || {}; }); o[seg[seg.length - 1]] = JSON.parse(val); });
+  });
+  return docs;
+}
+function fromDocs(docs) {
+  const items = id => Object.values((docs[id] && docs[id].items) || {}), m = docs.meta || {}, tasks = [];
+  for (let i = 0; i < BUCKETS; i++) tasks.push(...items('b' + i).filter(t => t && typeof t.id === 'string' && typeof t.wbs === 'string' && isISO(t.start) && isISO(t.end) && Array.isArray(t.deps))); // a field written to a task someone else just deleted leaves a fragment
+  return { meta: Object.assign({}, m.meta, { savedAt: P.meta.savedAt }), settings: m.settings || {}, baseline: m.baseline, stats: m.stats || {}, tasks: tasks.sort(wbsCmp), risks: items('risks').sort((a, b) => (a.id < b.id ? 1 : -1)), resources: items('resources').sort((a, b) => String(a.name).localeCompare(String(b.name))), log: items('log').sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 200) };
+}
+function liveDiff(from, to) { // Firestore field updates that turn one flattened plan into the other
+  const ops = {}, del = firebase.firestore.FieldValue.delete();
+  Object.keys(to).forEach(id => {
+    const a = from[id] || {}, b = to[id], o = {}, kept = new Set(Object.keys(b).map(p => p.split('.').slice(0, 2).join('.')));
+    Object.keys(b).forEach(p => { if (a[p] !== b[p]) o[p] = JSON.parse(b[p]); });
+    Object.keys(a).forEach(p => { if (p in b) return; const it = p.split('.').slice(0, 2).join('.'); if (p.startsWith('items.') && !kept.has(it)) o[it] = del; else o[p] = del; });
+    if (Object.keys(o).length) ops[id] = o;
+  });
+  return ops;
+}
+function liveStatus(text) {
+  if (!Live.on) return;
+  setSaved(text || (Live.saving ? 'Saving…' : !Live.seeded ? 'The shared plan is not set up yet' : Live.canEdit ? 'All changes saved · live' : 'Live · view only'));
+}
+function pushChanges() {
+  if (!Live.on || !Live.seeded || !Live.canEdit || !Live.base) return;
+  const now = flatDocs(toDocs(P)), ops = liveDiff(Live.base, now), ids = Object.keys(ops);
+  Live.base = now;
+  if (!ids.length) return liveStatus();
+  const batch = Live.db.batch();
+  ids.forEach(id => batch.update(Live.db.collection('plan').doc(id), ops[id]));
+  Live.saving++; liveStatus();
+  clearTimeout(Live.waitTimer);
+  Live.waitTimer = setTimeout(() => { if (Live.saving) liveStatus('Waiting for a connection · keep this page open'); }, 6000);
+  batch.commit().then(() => { Live.saving--; liveStatus(); }).catch(() => { // the listener puts back the shared values
+    Live.saving--; liveStatus(); toast('That change could not be saved to the shared plan', 1);
+  });
+}
+const liveBusy = () => { const a = document.activeElement; return !!drag || $('#modal').open || !!(a && a.closest && a.closest('#view,#drawer') && (/INPUT|TEXTAREA|SELECT/.test(a.tagName) || a.isContentEditable)); };
+function applyRemote() { // waits while someone is typing or dragging, so a redraw does not interrupt them
+  clearTimeout(Live.timer);
+  if (!Live.stash) return;
+  if (liveBusy()) { Live.timer = setTimeout(applyRemote, 500); return; }
+  const rem = flatDocs(Live.stash); Live.stash = null;
+  if (Live.first) {
+    Live.first = false;
+    const mine = flatDocs(toDocs(P)), differs = Object.keys(rem).some(id => canon(rem[id]) !== canon(mine[id] || {}));
+    let seenLive = false; try { seenLive = !!localStorage.getItem(KEY + '-live'); localStorage.setItem(KEY + '-live', '1'); } catch (e) { /* optional */ }
+    const old = hadLocal && !seenLive && differs ? planFile() : null;
+    adopt(fromDocs(unflatDocs(rem))); setLevel(UI.level);
+    Live.base = flatDocs(toDocs(P)); persist(); renderAll(); liveStatus();
+    if (old) {
+      $('#banner').innerHTML = '<div><span>📬 This browser had its own copy of the plan. You are now seeing the shared plan.</span><span><button class="btn sm" id="oldSave">Download my old copy</button> <button class="btn sm" id="oldSkip">Dismiss</button></span></div>';
+      $('#oldSave').onclick = () => download(`NSDI_Plan_my_old_copy_${stamp()}.json`, new Blob([old], { type: 'application/json' }));
+      $('#oldSkip').onclick = () => { $('#banner').innerHTML = ''; };
+    }
+    return;
   }
-  let obj = null; try { obj = JSON.parse(b64dec(c)); } catch (e) { /* unreadable: can be replaced by the next save */ }
-  return sharedInfo(obj, j.sha);
+  const base = Live.base, cur = flatDocs(toDocs(P));
+  let changed = false;
+  [...new Set([...Object.keys(base), ...Object.keys(rem)])].forEach(id => {
+    const a = base[id] || {}, b = rem[id] || {}, c = cur[id] = cur[id] || {};
+    Object.keys(b).forEach(p => { if (a[p] !== b[p]) { c[p] = b[p]; changed = true; } });
+    Object.keys(a).forEach(p => { if (!(p in b)) { delete c[p]; changed = true; } });
+  });
+  if (!changed) return;
+  adopt(fromDocs(unflatDocs(cur)));
+  Live.base = flatDocs(toDocs(P));
+  undoStack = []; redoStack = []; // an undo step could otherwise bring back what someone else just replaced
+  persist(); renderAll(); liveStatus('Updated with the latest changes · ' + clock());
 }
-function takeShared(sh) {
-  if (!loadProjectObject(sh.obj, 'shared plan')) return;
-  setPub(sh.pub); setDirty(false); persist(); $('#banner').innerHTML = '';
+function showUploadBanner() {
+  if (Live.seeded || !Live.on) return;
+  $('#banner').innerHTML = Live.canEdit ? `<div><span>📤 The shared plan is empty. Upload the plan in this browser (${P.tasks.length} tasks) so everyone sees it.</span><span><button class="btn sm pri" data-act="liveUpload">Upload as the shared plan</button></span></div>` : '';
 }
-function dlgGhConnect(msg) {
-  dialog('☁ Connect to GitHub', `${msg ? `<p style="margin-top:0;color:var(--danger)">${esc(msg)}</p>` : ''}<p class="ink2" style="margin-top:0">Saving needs a GitHub account with write access to this plan's repository, and an access token. You do this once in each browser.</p>
-  <ul class="help ink2" style="padding-left:18px">
-  <li><b>Repository owner:</b> create a <a href="${GH_FINE}" target="_blank" rel="noopener">fine-grained token</a>. Under repository access, select only <code>Project_Managment_tool</code>. Contents should be “Read and write”.</li>
-  <li><b>Invited collaborator:</b> accept the invitation, then create a <a href="${GH_CLASSIC}" target="_blank" rel="noopener">classic token</a> with only the <code>public_repo</code> scope. GitHub does not let collaborators use fine-grained tokens. This token can write to every public repository your account can write to, so keep it private.</li></ul>
-  <div class="form"><label class="full">Paste the token here<input type="password" name="token" required autocomplete="off" spellcheck="false"></label>
-  <label class="full" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" name="remember" checked style="width:auto"> Remember it in this browser (untick on a shared computer)</label></div>
-  <p id="ghErr" role="alert" style="margin:10px 0 0;color:var(--danger)"></p>`, fd => {
-    const token = String(fd.get('token')).trim(), remember = !!fd.get('remember'), err = $('#ghErr');
-    err.textContent = 'Checking…';
-    (async () => {
-      const u = await ghReq('/user', {}, token);
-      if (!u.ok) { err.textContent = u.status === 401 ? 'GitHub did not accept that token. Check that it was copied in full and has not expired.' : `GitHub returned an error (${u.status}). Try again.`; return; }
-      const login = (await u.json()).login, rp = await ghReq(GH_REPO, {}, token), repo = rp.ok ? await rp.json() : {};
-      if (repo.permissions && repo.permissions.push === false) { err.textContent = `The account ${login} does not have write access to this repository. Ask the owner to add it as a collaborator, then accept the invitation.`; return; }
-      ghToken = token; ghUser = login;
-      if (remember) { try { localStorage.setItem(KEY + '-gh', JSON.stringify({ token, user: login })); } catch (e) { /* kept for this visit only */ } }
-      $('#modal').close(); dlgGhSave();
-    })().catch(() => { err.textContent = 'Could not reach GitHub. Check your connection and try again.'; });
+function onPlan(snap) {
+  if (snap.empty) { if (!snap.metadata.fromCache) { Live.seeded = false; showUploadBanner(); liveStatus(); } return; }
+  if (!Live.seeded) { Live.seeded = true; if ($('#banner [data-act=liveUpload]')) $('#banner').innerHTML = ''; }
+  const docs = {}; snap.forEach(d => { docs[d.id] = d.data(); });
+  Live.stash = docs;
+  applyRemote();
+}
+function updateAuthUI() {
+  const b = $('#authBtn'), u = Live.user;
+  b.hidden = !Live.on;
+  b.textContent = u ? '👤 ' + u.email.split('@')[0] : '👤 Sign in to edit';
+  document.body.classList.toggle('ro', Live.on && !Live.canEdit);
+}
+async function refreshRole() {
+  const u = Live.user;
+  Live.canEdit = false; Live.isOwner = false;
+  if (u && u.emailVerified) {
+    try { await Live.db.collection('editors').limit(1).get(); Live.isOwner = true; Live.canEdit = true; } // the rules let only the owner list editors
+    catch (e) { try { Live.canEdit = (await Live.db.collection('editors').doc(u.email.toLowerCase()).get()).exists; } catch (e2) { /* stays view only */ } }
+  }
+  if (u !== Live.user) return;
+  updateAuthUI(); showUploadBanner(); liveStatus();
+}
+function liveStart() {
+  if (!window.firebase) return setSaved('Online sync is unavailable · changes save in this browser only');
+  firebase.initializeApp(FB_CONFIG);
+  Live.db = firebase.firestore(); Live.auth = firebase.auth(); Live.on = true;
+  updateAuthUI(); liveStatus('Connecting to the shared plan…');
+  Live.auth.onAuthStateChanged(u => { Live.user = u; refreshRole(); });
+  Live.db.collection('plan').onSnapshot(onPlan, () => { Live.on = false; updateAuthUI(); setSaved('Could not reach the shared plan · showing the copy in this browser'); });
+}
+const authMsg = e => ({ 'auth/invalid-credential': 'The email or password is not right.', 'auth/wrong-password': 'The email or password is not right.', 'auth/user-not-found': 'The email or password is not right.', 'auth/invalid-email': 'That email address is not valid.', 'auth/email-already-in-use': 'That email already has an account. Sign in, or use “Forgot password”.', 'auth/weak-password': 'Use a password of at least 6 characters.', 'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.', 'auth/network-request-failed': 'Could not reach the sign-in service. Check your connection.' }[e && e.code] || 'That did not work. Please try again.');
+const authErr = t => { const el = $('#authErr'); if (el) el.textContent = t; };
+function reopenAccount() { const m = $('#modal'); if (m.open) m.close(); dlgAccount(); }
+function dlgAccount() {
+  const u = Live.user, errP = '<p id="authErr" role="alert" style="margin:10px 0 0;color:var(--danger)"></p>';
+  if (!u) {
+    return dialog('👤 Sign in to edit', `<p class="ink2" style="margin-top:0">Viewing needs no account. To edit, use an account with an email on the editors list. You stay signed in on this browser.</p>
+    <div class="form"><label class="full">Email<input type="email" name="email" required autocomplete="username"></label><label class="full">Password<input type="password" name="password" required autocomplete="current-password"></label></div>
+    <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="btn sm" data-act="authCreate">Create an account</button><button type="button" class="btn sm" data-act="authForgot">Forgot password</button></div>${errP}`, fd => {
+      Live.auth.signInWithEmailAndPassword(String(fd.get('email')).trim(), String(fd.get('password'))).then(() => { $('#modal').close(); toast('Signed in'); }, e => authErr(authMsg(e)));
+      return false;
+    }, 'Sign in');
+  }
+  if (!u.emailVerified) {
+    return dialog('✉️ Confirm your email', `<p style="margin-top:0">We sent a confirmation link to <b>${esc(u.email)}</b>. Click it, then come back here. Check your spam folder if you can't find it.</p>
+    <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="btn pri" data-act="authCheck">I've confirmed it</button><button type="button" class="btn" data-act="authResend">Send it again</button><button type="button" class="btn" data-act="authOut">Sign out</button></div>${errP}`);
+  }
+  if (!Live.canEdit) {
+    return dialog('👤 View only', `<p style="margin-top:0"><b>${esc(u.email)}</b> is not on the editors list yet. Ask the plan owner to add this address, then check again.</p>
+    <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="btn pri" data-act="authCheck">Check again</button><button type="button" class="btn" data-act="authOut">Sign out</button></div>${errP}`);
+  }
+  if (!Live.isOwner) {
+    return dialog('👤 Your account', `<p style="margin-top:0">You are signed in as <b>${esc(u.email)}</b> and can edit the plan. Changes save automatically and everyone sees them within seconds.</p><button type="button" class="btn" data-act="authOut">Sign out</button>`);
+  }
+  dialog('👤 Editors', `<p class="ink2" style="margin-top:0">You are the owner (<b>${esc(u.email)}</b>). Anyone with the link can view. Only the people below can edit, once they create an account with the same email.</p>
+  <div id="edList" class="ink2">Loading…</div>
+  <div class="form" style="margin-top:10px"><label class="full">Add an editor's email<input type="email" name="email" required></label></div>
+  <div style="margin-top:10px"><button type="button" class="btn sm" data-act="authOut">Sign out</button></div>${errP}`, fd => {
+    const email = String(fd.get('email')).trim().toLowerCase();
+    Live.db.collection('editors').doc(email).set({ addedAt: new Date().toISOString() }).then(() => { toast('Added ' + email); reopenAccount(); }, () => authErr('Could not add that editor.'));
     return false;
-  }, 'Connect');
-}
-function dlgGhSave() {
-  dialog('☁ Save to GitHub', `<p class="ink2" style="margin-top:0">This replaces the shared plan with your copy. Everyone gets it the next time they open or reload the tool, and GitHub keeps the earlier versions.</p>
-  <div class="form"><label class="full">What changed (optional)<input name="note" maxlength="120" placeholder="e.g. Updated start dates for stage 2"></label></div>
-  <p class="ink2" style="margin:10px 0 0">Connected as <b>${esc(ghUser)}</b> · <button type="button" class="btn sm" data-act="ghDisconnect">Disconnect</button></p>`, fd => { pushPlan(String(fd.get('note') || '').trim()); }, 'Save to GitHub');
-}
-function dlgGhConflict(sh) {
-  setSaved('Not saved to GitHub · a newer plan is there');
-  dialog('⚠ Someone saved first', `<p style="margin-top:0"><b>${esc(sh.by)}</b> saved the shared plan on ${esc(new Date(sh.pub).toLocaleString())}, after your copy was last updated from GitHub. Your changes were not sent, so their work is safe.</p>
-  <p class="ink2">Your changes are still in this browser. To continue, load the newer plan, redo your changes, and save again. Download your copy first so you can check what you changed.</p>
-  <button type="button" class="btn" data-act="saveJson">💾 Download my copy</button>`, () => takeShared(sh), 'Load newer plan (replaces mine)');
-}
-async function pushPlan(note) {
-  ghBusy = true; setSaved('Saving to GitHub…');
-  try {
-    persist();
-    const at = P.meta.savedAt, body = planFile({ savedBy: ghUser });
-    const sh = await fetchShared();
-    if (sh && sh.obj && sh.pub !== getPub()) return dlgGhConflict(sh);
-    const r = await ghReq(`${GH_REPO}/contents/${GH_FILE}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ message: note ? 'Update plan: ' + note : 'Update plan', content: b64enc(body), branch: GH_BRANCH }, sh ? { sha: sh.sha } : {})) });
-    if (r.status === 409 || r.status === 422) { const latest = await fetchShared(); if (latest && latest.obj) return dlgGhConflict(latest); }
-    if (!r.ok) throw Object.assign(new Error('GitHub ' + r.status), { status: r.status });
-    setPub(at);
-    if (P.meta.savedAt === at) { setDirty(false); setSaved('Saved to GitHub · ' + clock()); } else setSaved('Saved to GitHub · newer edits are not on GitHub yet');
-    toast('Saved to GitHub');
-  } catch (e) {
-    setSaved('Saved in this browser · not on GitHub yet');
-    if (e.status === 401) { ghForget(); dlgGhConnect('GitHub no longer accepts your token. It may have expired. Create a new one to save. Your changes are still in this browser.'); }
-    else if (e.status === 403 || e.status === 404) { ghForget(); dlgGhConnect('GitHub refused the save. This token or account does not have write access to the repository. Your changes are still in this browser.'); }
-    else toast('Could not save to GitHub. Your changes are still in this browser.', 1);
-  } finally { ghBusy = false; }
+  }, 'Add editor');
+  Live.db.collection('editors').get().then(s => {
+    const el = $('#edList'); if (!el) return;
+    el.innerHTML = s.docs.map(d => `<div class="mini-row" style="cursor:default"><span>${esc(d.id)}</span><button type="button" class="btn sm danger" data-act="edRemove" data-email="${esc(d.id)}">Remove</button></div>`).join('') || 'No other editors yet.';
+  }, () => { const el = $('#edList'); if (el) el.textContent = 'Could not load the list.'; });
 }
 
 /* ---------- import / export ---------- */
@@ -1115,6 +1201,7 @@ function exportJson() { persist(); download(`NSDI_Plan_${stamp()}.json`, new Blo
 function loadProjectObject(obj, name) {
   const p = obj && obj.project ? obj.project : obj;
   if (!validProject(p)) { toast('That file is not a valid project file', 1); return false; }
+  if (viewOnly()) return false;
   if (undoStack.length < 40) undoStack.push(snapshot());
   adopt(p); logIt('Loaded ' + name); save(); setLevel(UI.level); UI.sel = null; renderAll(); toast('Loaded ' + name);
   return true;
@@ -1160,26 +1247,13 @@ function importWorkbook(buf, name) {
     const qa = new Map(a.slice(h + 1).map(r => [String(r[cc]).trim(), String(r[cq]).trim()]));
     rows.forEach(r => { if (qa.get(r.wbs)) r.qa = qa.get(r.wbs); });
   });
-  dialog('📥 Import from Excel', `<p>Found <b>${rows.length}</b> tasks in “${esc(wsName)}” of ${esc(name)}. This replaces the plan in this browser; you can undo it right after.</p>`, () => {
+  dialog('📥 Import from Excel', `<p>Found <b>${rows.length}</b> tasks in “${esc(wsName)}” of ${esc(name)}. This replaces the ${Live.seeded ? 'shared plan for everyone' : 'plan in this browser'}; you can undo it right after.</p>`, () => {
     const np = buildFromRows(rows, name);
     np.meta = Object.assign({}, P.meta, { source: name });
     np.risks = P.risks; np.resources = P.resources;
     rows.forEach((r, i) => { const t = np.tasks[i]; if (!t) return; if (r._p !== '' && r._p != null && !isNaN(+r._p)) t.progress = clamp(+r._p, 0, 100); if (String(r._m).toLowerCase() === 'yes') t.ms = true; if (r._n) t.notes = String(r._n); });
     loadProjectObject(np, name);
   }, 'Replace plan');
-}
-function checkPublished() {
-  if (!/^https?:/.test(location.protocol)) return;
-  // The GitHub API has the latest version straight away; the Pages copy can lag by minutes, so it is only a fallback (for example when the API rate limit is reached)
-  fetchShared().catch(() => fetch(GH_FILE, { cache: 'no-store' }).then(r => (r.ok ? r.json() : null)).then(o => (o ? sharedInfo(o, '') : null))).then(sh => {
-    if (!sh || !sh.obj) return;
-    const seen = getPub();
-    if (sh.sha ? sh.pub === seen : sh.pub <= seen) return;
-    if (!dirty) { adopt(sh.obj.project || sh.obj); setLevel(UI.level); setPub(sh.pub); persist(); renderAll(); setSaved('Latest shared plan loaded · saved by ' + sh.by); return; }
-    $('#banner').innerHTML = `<div><span>📬 ${esc(sh.by)} saved a newer shared plan on ${esc(new Date(sh.pub).toLocaleString())}. Your copy has changes that are not on GitHub.</span><span><button class="btn sm pri" id="pubLoad">Load it (replaces my copy)</button> <button class="btn sm" id="pubSkip">Keep mine for now</button></span></div>`;
-    $('#pubLoad').onclick = () => takeShared(sh);
-    $('#pubSkip').onclick = () => { $('#banner').innerHTML = ''; };
-  }).catch(() => { /* no shared plan */ });
 }
 
 /* ---------- events ---------- */
@@ -1189,13 +1263,29 @@ const ACTIONS = {
   theme: () => { const r = document.documentElement, dark = r.dataset.theme ? r.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches; r.dataset.theme = dark ? 'light' : 'dark'; saveUI(); },
   help: dlgHelp, share: dlgShare,
   copyUrl: () => { const u = $('#shareUrl'); (navigator.clipboard ? navigator.clipboard.writeText(u.value) : Promise.reject()).then(() => toast('Link copied'), () => { u.select(); toast('Press Ctrl+C to copy'); }); },
-  ghSave: () => {
-    if (ghBusy) return;
-    if (!ghToken) return dlgGhConnect();
-    if (!dirty && getPub()) return toast('No changes to save since your last update from GitHub');
-    dlgGhSave();
+  account: dlgAccount,
+  authCreate: () => {
+    const f = $('#dlgForm');
+    if (!f.reportValidity()) return;
+    Live.auth.createUserWithEmailAndPassword(f.email.value.trim(), f.password.value).then(c => c.user.sendEmailVerification().then(reopenAccount), e => authErr(authMsg(e)));
   },
-  ghDisconnect: () => { ghForget(); $('#modal').close(); toast('Disconnected from GitHub in this browser'); },
+  authForgot: () => {
+    const email = $('#dlgForm').email.value.trim();
+    if (!email) return authErr('Enter your email first.');
+    Live.auth.sendPasswordResetEmail(email).then(() => authErr('If that email has an account, a reset link is on its way.'), e => authErr(authMsg(e)));
+  },
+  authResend: () => { Live.user.sendEmailVerification().then(() => authErr('Sent. Check your inbox.'), e => authErr(authMsg(e))); },
+  authCheck: async () => {
+    try { await Live.user.reload(); await Live.user.getIdToken(true); await refreshRole(); reopenAccount(); } catch (e) { authErr(authMsg(e)); }
+  },
+  authOut: () => { Live.auth.signOut().then(() => { $('#modal').close(); toast('Signed out'); }); },
+  edRemove: el => { Live.db.collection('editors').doc(el.dataset.email).delete().then(() => { toast('Removed ' + el.dataset.email); reopenAccount(); }, () => authErr('Could not remove that editor.')); },
+  liveUpload: () => {
+    const docs = toDocs(P), batch = Live.db.batch();
+    Object.keys(docs).forEach(id => batch.set(Live.db.collection('plan').doc(id), docs[id]));
+    liveStatus('Uploading the plan…');
+    batch.commit().then(() => toast('The shared plan is ready'), () => { liveStatus(); toast('The upload did not go through', 1); });
+  },
   saveJson: exportJson, exportXlsx,
   loadJson: () => $('#fileJson').click(),
   importXlsx: () => $('#fileXlsx').click(),
@@ -1317,7 +1407,11 @@ document.addEventListener('change', async e => {
   }
   if (el.id === 'fileJson' && el.files[0]) {
     const f = el.files[0]; el.value = '';
-    try { loadProjectObject(JSON.parse(await f.text()), f.name); } catch (err) { toast('Could not read that file', 1); }
+    try {
+      const obj = JSON.parse(await f.text());
+      if (Live.seeded && Live.canEdit) dialog('📂 Open project file', `<p style="margin-top:0">This replaces the shared plan for everyone with “${esc(f.name)}”. You can undo it right after.</p>`, () => { loadProjectObject(obj, f.name); }, 'Replace shared plan');
+      else loadProjectObject(obj, f.name);
+    } catch (err) { toast('Could not read that file', 1); }
     return;
   }
   if (el.id === 'fileXlsx' && el.files[0]) {
@@ -1361,8 +1455,8 @@ try { const u = JSON.parse(localStorage.getItem(UI_KEY) || '{}'); ['tab', 'zoom'
 const hadLocal = load();
 setLevel(UI.level);
 renderAll();
-setDirty(dirty || (hadLocal && !getPub())); // copies edited before this feature count as unsaved
-setSaved(hadLocal ? 'Restored from this browser' + (dirty ? ' · not on GitHub yet' : '') : 'Plan loaded from ' + (P.meta.source || 'workbook'));
-checkPublished();
-window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError, checkPublished };
+setSaved(hadLocal ? 'Restored from this browser' : 'Plan loaded from ' + (P.meta.source || 'workbook'));
+['-gh', '-dirty', '-pub'].forEach(k => { try { localStorage.removeItem(KEY + k); } catch (e) { /* optional */ } }); // left by the earlier Save to GitHub version
+liveStart();
+window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError, Live, commit, toDocs, fromDocs, flatDocs, unflatDocs, wbsCmp };
 })();
