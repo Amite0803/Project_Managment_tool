@@ -922,9 +922,40 @@ function viewHealth() {
   const rank = { bad: 0, warn: 1, ok: 2 };
   C.sort((a, b) => rank[a.sev] - rank[b.sev]);
   const clean = C.filter(c => c.sev === 'ok').length;
-  return `<div class="bar-tools"><b>${clean} of ${C.length} checks are clear</b><span class="grow"></span><button class="btn" data-act="fixConflicts">🛠 Apply dependencies to all tasks</button></div>
+  return `<div class="bar-tools"><b>${clean} of ${C.length} checks are clear</b><span class="grow"></span><button class="btn" data-act="fitEnd">📏 Fit tasks to project end</button><button class="btn" data-act="fixConflicts">🛠 Apply dependencies to all tasks</button></div>
   <div class="grid">${C.map(c => `<div class="card chk ${c.sev}"><details ${UI.openChk === c.id ? 'open' : ''}><summary><b>${c.sev === 'ok' ? '✓' : c.sev === 'bad' ? '⚠' : '•'} ${esc(c.title)}</b><span class="count">${c.items.length}</span></summary><p>${esc(c.desc)}</p>
   <div class="chk-list">${c.items.slice(0, 200).map(([t, m]) => `<div data-open="${t.id}"><span class="muted">${esc(t.wbs)}</span> ${esc(t.name)} — <span class="ink2">${esc(m)}</span></div>`).join('')}${c.items.length > 200 ? `<div class="muted">…and ${c.items.length - 200} more</div>` : ''}</div></details></div>`).join('')}</div>`;
+}
+function chainBehind(t) { // t and the tasks before it, following the link that sets each start, whether or not a gap has opened up
+  const out = [], seen = new Set();
+  for (let cur = t; cur && !seen.has(cur.id);) {
+    seen.add(cur.id); out.push(cur);
+    let next = null, best = -Infinity;
+    [cur, ...ancestors(cur)].forEach(a => a.deps.forEach(d => { const r = requiredStart(a, d); if (r > best) { best = r; next = I.byId.get(d.id); } }));
+    cur = next && leavesOf(next).reduce((a, b) => (b.end > a.end ? b : a));
+  }
+  return out;
+}
+const FIT_MAX_CUT = 0.25;
+function fitToEnd() { // shortens the longest task on the chain behind each late task, by at most a quarter of its original length, so short check and sign-off steps keep theirs
+  const pe = P.meta.projectEnd, peN = d2n(pe), was = new Map(), stuck = new Set(), auto = P.settings.autoSched;
+  P.settings.autoSched = true;
+  for (let guard = 0; guard < 500; guard++) {
+    const late = leaves().filter(t => t.end > pe && !stuck.has(t.id)).sort((a, b) => (a.end < b.end ? 1 : -1))[0];
+    if (!late) break;
+    const before = late.end;
+    propagate([late]); // a gap after its predecessor is the first thing to close
+    if (late.end !== before) continue;
+    const room = t => Math.floor((was.has(t.id) ? was.get(t.id) : t.dur) * FIT_MAX_CUT) - ((was.has(t.id) ? was.get(t.id) : t.dur) - t.dur);
+    const c = chainBehind(late).filter(t => !t.ms && room(t) > 0).sort((a, b) => b.dur - a.dur)[0];
+    if (!c) { stuck.add(late.id); continue; }
+    if (!was.has(c.id)) was.set(c.id, c.dur);
+    c.dur -= Math.min(wcount(peN + 1, d2n(late.end)), room(c)); setLeafStart(c, d2n(c.start)); propagate([c]);
+    if (late.end === before) stuck.add(late.id);
+  }
+  P.settings.autoSched = auto;
+  const changes = [...was].map(([id, from]) => ({ t: I.byId.get(id), from })).filter(x => x.t.dur !== x.from).sort((a, b) => wbsCmp(a.t, b.t));
+  return { changes, left: leaves().filter(t => t.end > pe) };
 }
 function warnPastEnd() {
   const n = P.meta.projectEnd ? leaves().filter(t => t.end > P.meta.projectEnd).length : 0;
@@ -1370,6 +1401,24 @@ const ACTIONS = {
   boardMore: el => { const s = el.dataset.s; UI.boardShow[s] = (UI.boardShow[s] || BOARD_CAP) + BOARD_CAP; renderView(); },
   addRisk: () => commit('Added a log entry', () => { P.risks.unshift({ id: 'r' + Date.now().toString(36), type: 'Risk', title: 'New entry', wbs: '', owner: '', prob: 3, impact: 3, status: 'Open', due: '', plan: '' }); }),
   delRisk: el => commit('Deleted a log entry', () => { P.risks = P.risks.filter(r => r.id !== el.dataset.id); }),
+  fitEnd: () => {
+    if (viewOnly()) return;
+    const pe = P.meta.projectEnd;
+    if (!pe) return toast('Set a project end date in Settings first', 1);
+    const late = leaves().filter(t => t.end > pe).length;
+    if (!late) return toast('Every task already finishes by the project end 🎉');
+    const keep = snapshot(), plan = fitToEnd();
+    const rows = plan.changes.map(c => `<tr><td class="nowrap">${esc(c.t.wbs)}</td><td>${esc(c.t.name)}</td><td class="nowrap">${c.from} → ${c.t.dur}</td></tr>`).join('');
+    const left = plan.left.map(t => `${t.wbs} (${fmtS(t.end)})`).join(', ');
+    Object.assign(P, JSON.parse(keep)); index(); rollup();
+    if (!plan.changes.length) return toast(`These ${late} tasks cannot be shortened automatically. Change their dates or links by hand.`, 1);
+    dialog('📏 Fit tasks to project end?', `<p style="margin-top:0">${late} task${late > 1 ? 's finish' : ' finishes'} after ${fmtS(pe)}. To fit, this closes gaps after their predecessors, then shortens the longest task on each chain by up to a quarter, so short check and sign-off steps keep their length. The tasks that follow move earlier. This changes the plan for everyone, and you can undo it right after.</p>
+    <div style="max-height:40vh;overflow:auto"><table><thead><tr><th>WBS</th><th>Task</th><th>Workdays</th></tr></thead><tbody>${rows}</tbody></table></div>
+    ${left ? `<p style="color:var(--danger)">Still past the end afterwards: ${esc(left)}. These need changing by hand.</p>` : ''}
+    <div class="form" style="margin-top:10px"><label class="full" style="flex-direction:row;gap:8px;align-items:center"><input type="checkbox" name="lock" checked style="width:auto"> Also turn on the limit, so tasks cannot go past the project end again</label></div>`, fd => {
+      commit('Fitted tasks to the project end', () => { fitToEnd(); if (fd.get('lock')) P.settings.lockEnd = true; });
+    }, 'Shorten these tasks');
+  },
   fixConflicts: () => {
     const C = healthChecks(), viol = C.find(c => c.id === 'viol').items.length, gap = C.find(c => c.id === 'gap').items.length;
     if (!viol && !gap) return toast('Every task already follows its dependencies 🎉');
@@ -1496,5 +1545,5 @@ renderAll();
 setSaved(hadLocal ? 'Restored from this browser' : 'Plan loaded from ' + (P.meta.source || 'workbook'));
 ['-gh', '-dirty', '-pub'].forEach(k => { try { localStorage.removeItem(KEY + k); } catch (e) { /* optional */ } }); // left by the earlier Save to GitHub version
 liveStart();
-window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError, setField, Live, commit, toDocs, fromDocs, flatDocs, unflatDocs, wbsCmp };
+window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError, setField, fitToEnd, Live, commit, toDocs, fromDocs, flatDocs, unflatDocs, wbsCmp };
 })();

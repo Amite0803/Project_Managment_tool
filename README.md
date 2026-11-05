@@ -57,6 +57,7 @@ Editors stay signed in on that browser. To remove someone, the owner clicks *Rem
 - A parent's links hold for its sub-tasks: sub-tasks without links of their own move with the parent as a block and cannot start before the date the parent's links require.
 - Dates only move when a task or its predecessor changes. *Plan Health › Apply dependencies to all tasks* applies the rule to the whole plan at once.
 - Settings has the project start and end dates and an option that blocks edits taking a task past the end. Tasks already past the end stay where they are and are listed in Plan Health. The limit rejects the whole edit, including tasks it would push.
+- *Plan Health › Fit tasks to project end* brings late tasks back inside the end date. For each one it closes any gap after its predecessor, then shortens the longest task on the chain behind it by up to a quarter, so short check and sign-off steps keep their length. It shows every duration change before applying, and lists anything it cannot fit.
 - Turn off "Schedule tasks from their dependencies" in Settings to set linked dates by hand.
 - The workbook has no progress column, so starting progress is estimated from status: Not started 0%, Ongoing 50%, Review and QA 90%, Done 100%.
 - Milestones are seeded from zero-duration tasks and from names containing sign-off, final approval, kickoff or acceptance certificate.
