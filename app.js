@@ -127,13 +127,13 @@ function rollup() {
 
 /* ---------- scheduling ---------- */
 function setLeafStart(t, n) { n = snap(n); t.start = n2d(n); t.end = n2d(t.dur <= 1 ? n : wshift(n, t.dur - 1)); }
-function requiredStart(t, dep) {
+function requiredStart(t, dep, base = d2n(t.start)) {
   const p = I.byId.get(dep.id), ps = d2n(p.start), pe = d2n(p.end), lag = dep.lag || 0;
   switch (dep.type) {
     case 'SS': return wshift(ps, lag);
     case 'FF': case 'SF': {
       const reqEnd = wshift(dep.type === 'FF' ? pe : ps, lag);
-      return isSum(t) ? d2n(t.start) + (reqEnd - d2n(t.end)) : wshift(reqEnd, -(Math.max(t.dur, 1) - 1));
+      return isSum(t) ? base + (reqEnd - d2n(t.end)) : wshift(reqEnd, -(Math.max(t.dur, 1) - 1));
     }
     default: return wshift(pe, 1 + lag);
   }
@@ -141,33 +141,42 @@ function requiredStart(t, dep) {
 function shiftTask(t, days) {
   leavesOf(t).forEach(l => setLeafStart(l, d2n(l.start) + days));
 }
-function enforce(t) {
+const depsReq = (t, base) => t.deps.reduce((m, d) => Math.max(m, requiredStart(t, d, base)), -Infinity);
+const floorFrom = t => ancestors(t).reduce((m, a) => (a.deps.length ? Math.max(m, depsReq(a)) : m), -Infinity); // a parent's links hold for everything under it
+const nearestLinked = t => (t.deps.length ? t : ancestors(t).find(a => a.deps.length));
+function enforce(t) { // puts a task exactly where its links say; a task with no links is only kept from starting before its parent's links allow
+  if (!isSum(t)) {
+    const s = d2n(t.start), floor = floorFrom(t), req = snap(t.deps.length ? Math.max(depsReq(t), floor) : Math.max(s, floor));
+    if (req === s) return false;
+    setLeafStart(t, req);
+    return true;
+  }
   if (!t.deps.length) return false;
-  let req = -Infinity;
-  t.deps.forEach(d => { req = Math.max(req, requiredStart(t, d)); });
-  const s = d2n(t.start);
-  if (req <= s) return false;
-  shiftTask(t, req - s);
-  rollup();
+  const free = leavesOf(t).filter(l => nearestLinked(l) === t); // sub-tasks with links of their own follow those instead
+  if (!free.length) return false;
+  const base = Math.min(...free.map(l => d2n(l.start))), delta = Math.max(depsReq(t, base), floorFrom(t)) - base;
+  if (!delta) return false;
+  free.forEach(l => setLeafStart(l, d2n(l.start) + delta));
   return true;
 }
 function propagate(seed) {
   rollup();
   if (!P.settings.autoSched) return 0;
-  const q = [], moved = new Set();
-  seed.forEach(t => { if (enforce(t)) moved.add(t.id); q.push(t); });
-  let guard = 0;
-  while (q.length && guard++ < 20000) {
-    const t = q.shift();
-    [t, ...ancestors(t)].forEach(a => I.succ.get(a.id).forEach(s => {
-      if (enforce(s)) { moved.add(s.id); q.push(s, ...descendants(s)); }
-    }));
+  const scope = new Set(); seed.forEach(s => reach(s).forEach(id => scope.add(id)));
+  const list = P.tasks.filter(t => scope.has(t.id)), seeds = new Set(seed.map(t => t.id));
+  const was = new Map(list.map(t => [t.id, t.start + t.end]));
+  for (let pass = 0, again = true; again && pass < 40; pass++) {
+    again = false;
+    list.forEach(t => { if (enforce(t)) { rollup(); again = true; } });
   }
-  return moved.size;
+  return list.filter(t => !isSum(t) && !seeds.has(t.id) && was.get(t.id) !== t.start + t.end).length;
 }
 function cascade(seed) {
   const n = propagate(seed);
   if (n) toast(`${n} dependent task${n > 1 ? 's were' : ' was'} rescheduled. Press Ctrl+Z to undo.`);
+}
+function followsLinks(t, wanted) {
+  if (P.settings.autoSched && t.start !== wanted) toast(`${t.wbs} starts ${fmtS(t.start)} because of its dependencies. To change that, edit the link type or lag.`);
 }
 function reach(start) { // tasks whose dates are driven by `start`
   const seen = new Set(), q = [start, ...descendants(start)];
@@ -244,10 +253,23 @@ function viewOnly() {
   toast(Live.user ? 'Your account cannot edit yet. Click your name at the top for details.' : 'This is view only. Use “Sign in to edit” to make changes.', 1);
   return true;
 }
+function pastEndError(before) { // only blocks tasks this edit newly takes past the end, so tasks already past it don't stop other edits
+  const pe = P.meta.projectEnd;
+  if (!P.settings.lockEnd || !pe) return '';
+  const old = new Map(JSON.parse(before).tasks.map(t => [t.id, t.end]));
+  const bad = leaves().filter(t => t.end > pe && !(old.get(t.id) >= t.end));
+  if (!bad.length) return '';
+  return `Not changed: ${bad[0].wbs} would finish ${fmtS(bad[0].end)}${bad.length > 1 ? ` (and ${bad.length - 1} more)` : ''}, after the ${fmtS(pe)} project end. You can turn this limit off in Settings.`;
+}
 function commit(label, fn) {
   if (viewOnly()) { renderAll(); return false; }
   const snapShot = snapshot();
-  if (fn() === false) { Object.assign(P, JSON.parse(snapShot)); index(); rollup(); renderAll(); return false; }
+  toastHold = []; // "rescheduled" messages wait until the edit is accepted
+  let ok = false, err = '', held = [];
+  try { ok = fn() !== false; } finally { held = toastHold; toastHold = null; }
+  if (ok) { index(); rollup(); err = pastEndError(snapShot); if (err) toast(err, 1); }
+  if (!ok || err) { Object.assign(P, JSON.parse(snapShot)); index(); rollup(); renderAll(); return false; }
+  held.forEach(m => toast(m));
   undoStack.push(snapShot); if (undoStack.length > 40) undoStack.shift(); redoStack = [];
   logIt(label); index(); rollup(); save(); renderAll();
   return true;
@@ -271,7 +293,7 @@ function setField(t, f, v) {
       if (sum) { toast('Renumber a parent by editing its sub-tasks first', 1); return false; }
       t.wbs = v; t.dup = false; index(); break;
     }
-    case 'start': if (sum || !isISO(v)) return false; setLeafStart(t, d2n(v)); cascade([t]); break;
+    case 'start': if (sum || !isISO(v)) return false; setLeafStart(t, d2n(v)); cascade([t]); followsLinks(t, n2d(snap(d2n(v)))); break;
     case 'end': {
       if (sum || !isISO(v) || v < t.start) { if (v < t.start) toast('End date cannot be before the start', 1); return false; }
       const e = d2n(v); t.dur = wcount(d2n(t.start), e) || 1; t.end = n2d(snap(e)); cascade([t]); break;
@@ -689,7 +711,7 @@ function renderGantt() {
     return s + '</g>';
   }).join('');
   const rowLines = rows.map((t, i) => (t.id === UI.sel ? `<rect class="selb" x="0" y="${i * rh}" width="${W}" height="${rh}"/>` : '') + `<line class="rl" x1="0" x2="${W}" y1="${(i + 1) * rh - .5}" y2="${(i + 1) * rh - .5}"/>`).join('');
-  const peLine = P.meta.projectEnd && d2n(P.meta.projectEnd) >= r0 && d2n(P.meta.projectEnd) <= r1 ? `<line class="pe" x1="${x(d2n(P.meta.projectEnd))}" x2="${x(d2n(P.meta.projectEnd))}" y1="0" y2="${H}"/>` : '';
+  const peLine = [P.meta.projectStart, P.meta.projectEnd].filter(v => v && d2n(v) >= r0 && d2n(v) <= r1).map(v => `<line class="pe" x1="${x(d2n(v))}" x2="${x(d2n(v))}" y1="0" y2="${H}"/>`).join('');
   const todayLine = T >= r0 && T <= r1 ? `<line class="today" x1="${x(T) + ppd / 2}" x2="${x(T) + ppd / 2}" y1="0" y2="${H}"/>` : '';
 
   const vis = new Set(rows.map(t => t.id));
@@ -748,7 +770,7 @@ function ganttPointerUp(e) {
     return;
   }
   if (!days) { renderGantt(); return; }
-  if (d.role === 'move') commit(`Moved ${t.wbs} by ${days} days`, () => { shiftTask(t, days); rollup(); cascade([t, ...descendants(t)]); });
+  if (d.role === 'move') commit(`Moved ${t.wbs} by ${days} days`, () => { shiftTask(t, days); rollup(); const wanted = t.start; cascade([t, ...descendants(t)]); followsLinks(t, wanted); });
   else commit(`Resized ${t.wbs}`, () => setField(t, 'end', n2d(Math.max(d2n(t.start), d2n(t.end) + days))));
 }
 function tryLink(p, s, type, lag) {
@@ -881,7 +903,8 @@ function healthChecks() {
   push('overdue', 'bad', 'Overdue tasks', 'End date has passed and the task is not marked Done.', ls.filter(t => t.status !== 'Done' && d2n(t.end) < T).map(t => [t, `ended ${fmtS(t.end)} · ${t.status}`]));
   push('late', 'warn', 'Should have started', 'Start date has passed but the status is still Not started.', ls.filter(t => t.status === 'Not started' && d2n(t.start) < T && d2n(t.end) >= T).map(t => [t, `start ${fmtS(t.start)}`]));
   const viol = []; P.tasks.forEach(t => t.deps.forEach(d => { const r = requiredStart(t, d); if (r > d2n(t.start)) viol.push([t, `starts ${fmtS(t.start)}, but ${I.byId.get(d.id).wbs} (${d.type}) requires ${fmtS(n2d(r))}`]); }));
-  push('viol', 'bad', 'Dependency conflicts', 'The task starts before its predecessor allows. “Fix conflicts” below moves these forward.', viol);
+  push('viol', 'bad', 'Dependency conflicts', 'The task starts before its predecessor allows. “Apply dependencies to all tasks” above moves these.', viol);
+  push('gap', 'warn', 'Waiting after a dependency', 'The task starts later than its links require, usually dates carried over from the workbook. It moves to the required date when it or a predecessor next changes, or when you use “Apply dependencies to all tasks” above.', ls.filter(t => t.deps.length && snap(Math.max(depsReq(t), floorFrom(t))) < d2n(t.start)).map(t => [t, `starts ${fmtS(t.start)}, links require ${fmtS(n2d(snap(Math.max(depsReq(t), floorFrom(t)))))}`]));
   const stale = P.tasks.filter(t => isSum(t) && t.srcStatus && t.srcStatus !== t.status).map(t => [t, `workbook said “${t.srcStatus}”, sub-tasks roll up to “${t.status}”`]);
   push('stat', 'warn', 'Summary status differs from workbook', 'The app derives each summary status from its sub-tasks; these differ from the value typed in the workbook.', stale);
   const span = P.tasks.filter(t => isSum(t) && t.srcStart && (t.srcStart !== t.start || t.srcEnd !== t.end) && P.baseline && P.baseline.map[t.id] && P.baseline.map[t.id][0] === t.srcStart).map(t => [t, `workbook ${fmtS(t.srcStart)}–${fmtS(t.srcEnd)}, sub-tasks span ${fmtS(t.start)}–${fmtS(t.end)}`]);
@@ -890,6 +913,7 @@ function healthChecks() {
   push('note', 'warn', 'Unresolved dependency text', 'Workbook dependency text that could not be turned into a link.', P.tasks.filter(t => /Unknown predecessor|after project end/i.test(t.depNote)).map(t => [t, t.depNote]));
   push('own', 'warn', 'Tasks without an owner', 'Bottom-level tasks with no task owner.', ls.filter(t => !t.owner).map(t => [t, 'no owner']));
   push('dur', 'warn', 'Tasks without a duration', 'Bottom-level tasks with a zero duration that are not milestones.', ls.filter(t => !t.dur && !t.ms).map(t => [t, 'no duration']));
+  if (P.meta.projectStart) push('begin', 'bad', 'Before the project start date', `Bottom-level tasks starting before the project start date (${fmtS(P.meta.projectStart)}).`, ls.filter(t => t.start < P.meta.projectStart).map(t => [t, `starts ${fmtS(t.start)}`]));
   if (P.meta.projectEnd) push('end', 'bad', 'Past the project end date', `Bottom-level tasks finishing after the project end date (${fmtS(P.meta.projectEnd)}). Warranty tasks may be expected here.`, ls.filter(t => t.end > P.meta.projectEnd).map(t => [t, `ends ${fmtS(t.end)}`]));
   return out;
 }
@@ -898,24 +922,30 @@ function viewHealth() {
   const rank = { bad: 0, warn: 1, ok: 2 };
   C.sort((a, b) => rank[a.sev] - rank[b.sev]);
   const clean = C.filter(c => c.sev === 'ok').length;
-  return `<div class="bar-tools"><b>${clean} of ${C.length} checks are clear</b><span class="grow"></span><button class="btn" data-act="fixConflicts">🛠 Fix dependency conflicts</button></div>
+  return `<div class="bar-tools"><b>${clean} of ${C.length} checks are clear</b><span class="grow"></span><button class="btn" data-act="fixConflicts">🛠 Apply dependencies to all tasks</button></div>
   <div class="grid">${C.map(c => `<div class="card chk ${c.sev}"><details ${UI.openChk === c.id ? 'open' : ''}><summary><b>${c.sev === 'ok' ? '✓' : c.sev === 'bad' ? '⚠' : '•'} ${esc(c.title)}</b><span class="count">${c.items.length}</span></summary><p>${esc(c.desc)}</p>
   <div class="chk-list">${c.items.slice(0, 200).map(([t, m]) => `<div data-open="${t.id}"><span class="muted">${esc(t.wbs)}</span> ${esc(t.name)} — <span class="ink2">${esc(m)}</span></div>`).join('')}${c.items.length > 200 ? `<div class="muted">…and ${c.items.length - 200} more</div>` : ''}</div></details></div>`).join('')}</div>`;
+}
+function warnPastEnd() {
+  const n = P.meta.projectEnd ? leaves().filter(t => t.end > P.meta.projectEnd).length : 0;
+  if (n) toast(`${n} task${n > 1 ? 's already finish' : ' already finishes'} after the project end date. They stay where they are; Plan Health lists them.`);
 }
 function viewSettings() {
   return `<div class="grid two">
   <div class="card"><h3>Project</h3><div class="form">
     <label class="full">Title<input data-meta-in="title" value="${esc(P.meta.title)}"></label>
     <label class="full">Subtitle<input data-meta-in="subtitle" value="${esc(P.meta.subtitle)}"></label>
+    <label>Project start date<input type="date" data-meta-in="projectStart" value="${esc(P.meta.projectStart || '')}"></label>
     <label>Project end date<input type="date" data-meta-in="projectEnd" value="${esc(P.meta.projectEnd)}"></label>
-    <label>Source<input value="${esc(P.meta.source || '')}" disabled></label>
+    <label class="full" style="flex-direction:row;gap:8px;align-items:center"><input type="checkbox" id="lockEnd" style="width:auto" ${P.settings.lockEnd ? 'checked' : ''}> Tasks cannot go past the project end date</label>
+    <label class="full">Source<input value="${esc(P.meta.source || '')}" disabled></label>
   </div></div>
   <div class="card"><h3>Schedule rules</h3><div class="form">
-    <label class="full" style="flex-direction:row;gap:8px;align-items:center"><input type="checkbox" id="autoSched" style="width:auto" ${P.settings.autoSched ? 'checked' : ''}> Auto-push later tasks when a predecessor moves</label>
+    <label class="full" style="flex-direction:row;gap:8px;align-items:center"><input type="checkbox" id="autoSched" style="width:auto" ${P.settings.autoSched ? 'checked' : ''}> Schedule tasks from their dependencies: a task with a predecessor starts according to the link type and lag</label>
     <label class="full">Holidays, one date per line (YYYY-MM-DD). Weekends are Saturday and Sunday.<textarea id="holidays" rows="4" placeholder="2027-01-01">${esc((P.settings.holidays || []).join('\n'))}</textarea></label>
   </div><p class="muted" style="font-size:12.5px;margin:8px 0 0">The workbook counts no holidays, so none are set. Adding them only affects tasks you change afterwards.</p></div>
   <div class="card"><h3>Baseline</h3><p class="ink2" style="margin-top:0">Current baseline: <b>${esc((P.baseline && P.baseline.label) || 'none')}</b>${P.baseline ? ` · ${fmt(P.baseline.savedAt.slice(0, 10))}` : ''}. Compare against it on the Gantt and Milestones tabs.</p><button class="btn" data-act="setBaseline">📐 Save current plan as baseline</button></div>
-  <div class="card"><h3>Start over</h3><p class="ink2" style="margin-top:0">Replace all changes in this browser with the plan as first published. Save a project file first if you want a copy.</p><button class="btn danger" data-act="resetPlan">↺ Reset to original plan</button></div>
+  <div class="card"><h3>Start over</h3><p class="ink2" style="margin-top:0">Replace the shared plan for everyone with the original workbook plan. Save a project file first if you want a copy.</p><button class="btn danger" data-act="resetPlan">↺ Reset to original plan</button></div>
   <div class="card" style="grid-column:1/-1"><h3>Activity log</h3><div style="max-height:320px;overflow:auto">${P.log.map(l => `<div class="mini-row" style="cursor:default"><span>${esc(l.what)}</span><span class="muted nowrap">${l.by ? esc(l.by) + ' · ' : ''}${esc(new Date(l.at).toLocaleString())}</span></div>`).join('') || '<div class="muted">Changes you make will be listed here.</div>'}</div></div>
   </div>`;
 }
@@ -944,7 +974,9 @@ function renderGanttFresh() { // timeline range changes, so the old scroll offse
 function renderAll() { $('#appTitle').textContent = P.meta.title + ' · Planner'; renderTabs(); renderView(); renderDrawer(); saveUI(); }
 
 /* ---------- ui helpers ---------- */
+let toastHold = null;
 function toast(msg, err) {
+  if (toastHold && !err) { toastHold.push(msg); return; }
   const d = document.createElement('div'); d.className = 'toast' + (err ? ' err' : ''); d.textContent = msg;
   $('#toast').appendChild(d); setTimeout(() => d.remove(), err ? 5000 : 3000);
 }
@@ -1002,7 +1034,7 @@ function dlgHelp() {
   <li><b>Resources:</b> pick owners, roles and participants from the dropdowns. Add to the list on the Resources tab, or with “Add new resource” in any dropdown.</li>
   <li><b>Add dependencies:</b> hover a bar and drag the ○ onto the next task, or use Manage dependencies. Types: FS, SS, FF, SF, with lag in workdays.</li>
   <li><b>Milestones:</b> use ◆ Add milestone, or tick “Mark as a milestone” on any task.</li>
-  <li><b>Auto-scheduling:</b> when a task moves, the tasks that depend on it are pushed later if needed. Turn this off in Settings.</li>
+  <li><b>Auto-scheduling:</b> a task with a predecessor starts on the date its link type and lag require. When a task moves, the tasks that follow it move too, earlier or later. To delay a linked task, edit the lag. Turn this off in Settings.</li>
   <li><b>Saving:</b> anyone with the link can view. Editors use “Sign in to edit”; their changes save automatically and everyone sees them within seconds.</li>
   <li><b>Backups:</b> use File › Save project file now and then to keep a copy.</li>
   <li><b>Undo:</b> Ctrl+Z and Ctrl+Y.</li></ul>`);
@@ -1339,18 +1371,18 @@ const ACTIONS = {
   addRisk: () => commit('Added a log entry', () => { P.risks.unshift({ id: 'r' + Date.now().toString(36), type: 'Risk', title: 'New entry', wbs: '', owner: '', prob: 3, impact: 3, status: 'Open', due: '', plan: '' }); }),
   delRisk: el => commit('Deleted a log entry', () => { P.risks = P.risks.filter(r => r.id !== el.dataset.id); }),
   fixConflicts: () => {
-    const before = healthChecks().find(c => c.id === 'viol').items.length;
-    if (!before) return toast('No dependency conflicts to fix 🎉');
-    dialog('Fix dependency conflicts?', `<p>${before} link${before > 1 ? 's' : ''} break the dependency rules. This moves those tasks, and any tasks that follow them, later as needed. Some dates will change, and you can undo this.</p>`, () => {
-      commit('Fixed dependency conflicts', () => {
+    const C = healthChecks(), viol = C.find(c => c.id === 'viol').items.length, gap = C.find(c => c.id === 'gap').items.length;
+    if (!viol && !gap) return toast('Every task already follows its dependencies 🎉');
+    dialog('Apply dependencies to all tasks?', `<p>${viol} link${viol === 1 ? '' : 's'} start too early and ${gap} task${gap === 1 ? '' : 's'} start later than required. This puts every linked task on the date its links require, and tasks that follow them move too, earlier or later. Dates will change for everyone using the plan. You can undo this right after.</p>`, () => {
+      commit('Applied dependencies to all tasks', () => {
         const was = P.settings.autoSched; P.settings.autoSched = true;
-        const n = propagate(P.tasks.filter(t => t.deps.length)); P.settings.autoSched = was;
-        toast(`${n} tasks rescheduled`);
+        propagate(P.tasks.filter(t => t.deps.length)); P.settings.autoSched = was;
+        toast('All linked tasks now follow their dependencies');
       });
-    }, 'Fix conflicts');
+    }, 'Apply to all tasks');
   },
   setBaseline: () => dialog('📐 Save baseline', `<div class="form"><label class="full">Label<input name="label" value="Baseline ${stamp()}" required></label></div>`, fd => { commit('Saved a new baseline', () => { P.baseline = { label: String(fd.get('label')), savedAt: new Date().toISOString(), map: Object.fromEntries(P.tasks.map(t => [t.id, [t.start, t.end]])) }; }); }),
-  resetPlan: () => dialog('Reset to the original plan?', '<p>All changes in this browser will be replaced. You can undo this until you close the page.</p>', () => { const np = buildFromRows(window.SEED_ROWS, window.SEED_SOURCE); loadProjectObject(np, 'original plan'); }, 'Reset')
+  resetPlan: () => dialog('Reset to the original plan?', '<p>All changes to the shared plan will be replaced for everyone. You can undo this right after, until someone else makes a change or you close the page.</p>', () => { const np = buildFromRows(window.SEED_ROWS, window.SEED_SOURCE); loadProjectObject(np, 'original plan'); }, 'Reset')
 };
 document.addEventListener('click', e => {
   const m = e.target.closest('details.menu');
@@ -1397,7 +1429,13 @@ document.addEventListener('change', async e => {
     else commit(`Edited resource “${r.name}”`, () => { r[ds.resf] = el.value.trim(); });
     return;
   }
-  if (ds.metaIn) { commit(`Changed project ${ds.metaIn}`, () => { P.meta[ds.metaIn] = el.value; }); return; }
+  if (ds.metaIn) {
+    const dates = Object.assign({}, P.meta, { [ds.metaIn]: el.value });
+    if (dates.projectStart && dates.projectEnd && dates.projectStart > dates.projectEnd) { toast('The project start must be before the project end', 1); renderView(); return; }
+    if (commit(`Changed project ${ds.metaIn}`, () => { P.meta[ds.metaIn] = el.value; }) && ds.metaIn === 'projectEnd') warnPastEnd();
+    return;
+  }
+  if (el.id === 'lockEnd') { if (commit(el.checked ? 'Turned on the project end limit' : 'Turned off the project end limit', () => { P.settings.lockEnd = el.checked; }) && el.checked) warnPastEnd(); return; }
   if (el.id === 'autoSched') { commit('Changed auto-scheduling', () => { P.settings.autoSched = el.checked; }); return; }
   if (el.id === 'holidays') {
     const list = el.value.split(/\s+/).filter(Boolean), bad = list.filter(x => !isISO(x));
@@ -1458,5 +1496,5 @@ renderAll();
 setSaved(hadLocal ? 'Restored from this browser' : 'Plan loaded from ' + (P.meta.source || 'workbook'));
 ['-gh', '-dirty', '-pub'].forEach(k => { try { localStorage.removeItem(KEY + k); } catch (e) { /* optional */ } }); // left by the earlier Save to GitHub version
 liveStart();
-window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError, Live, commit, toDocs, fromDocs, flatDocs, unflatDocs, wbsCmp };
+window.__planner = { get P() { return P; }, get I() { return I; }, UI, F, moveTask, healthChecks, planStats, drivingChain, propagate, linkError, setField, Live, commit, toDocs, fromDocs, flatDocs, unflatDocs, wbsCmp };
 })();

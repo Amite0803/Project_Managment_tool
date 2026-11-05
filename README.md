@@ -52,7 +52,12 @@ Editors stay signed in on that browser. To remove someone, the owner clicks *Rem
 - Workdays are Monday to Friday, matching Excel `WORKDAY`. Holidays can be added in Settings.
 - Summary rows roll up from their sub-tasks: dates, progress and status. They can differ from the values typed in the workbook; Plan Health lists every difference.
 - Workbook entries where a task depends on its own parent (for example `1.1.1 (SS)` on `1.1.1.1`) are treated as part of the hierarchy, not as links.
-- Moving a task pushes dependent tasks later when needed. It does not pull them earlier.
+- A task with a predecessor starts on the date its links require: FS the next workday after the predecessor finishes, SS with it, FF and SF so it finishes on time, plus the lag in workdays. With several links, the latest date applies.
+- When a task changes, the tasks that follow it move too, earlier or later. To delay a linked task, edit the lag; a start date typed by hand goes back to the required date.
+- A parent's links hold for its sub-tasks: sub-tasks without links of their own move with the parent as a block and cannot start before the date the parent's links require.
+- Dates only move when a task or its predecessor changes. *Plan Health › Apply dependencies to all tasks* applies the rule to the whole plan at once.
+- Settings has the project start and end dates and an option that blocks edits taking a task past the end. Tasks already past the end stay where they are and are listed in Plan Health. The limit rejects the whole edit, including tasks it would push.
+- Turn off "Schedule tasks from their dependencies" in Settings to set linked dates by hand.
 - The workbook has no progress column, so starting progress is estimated from status: Not started 0%, Ongoing 50%, Review and QA 90%, Done 100%.
 - Milestones are seeded from zero-duration tasks and from names containing sign-off, final approval, kickoff or acceptance certificate.
 - Moving a task up or down swaps it with the neighbouring task under the same parent. The two trade WBS codes, including their sub-tasks; links and dates do not change. So codes can differ from the workbook after a move.
