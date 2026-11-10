@@ -63,6 +63,14 @@ main{flex:1;padding:14px 16px;min-width:0;outline:0}
 .bar-tools label{display:inline-flex;gap:5px;align-items:center;color:var(--ink2);font-size:13px}
 .bar-tools input[type=search]{width:190px}
 .bar-tools select{max-width:150px}
+.msel-btn{list-style:none;cursor:pointer;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 26px 5px 8px;max-width:170px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;position:relative}
+.msel-btn::-webkit-details-marker{display:none}
+.msel-btn::after{content:'▾';position:absolute;right:8px;top:50%;transform:translateY(-50%);color:var(--ink3)}
+.msel-btn.on{background:var(--pri-soft);border-color:var(--pri)}
+.msel-pop{left:0;right:auto;width:280px;max-height:340px;overflow:auto}
+.bar-tools .msel-pop label{display:flex;gap:8px;align-items:flex-start;padding:6px 9px;border-radius:8px;color:var(--ink);cursor:pointer}
+.msel-pop label:hover{background:var(--card2)}
+.msel-pop input{margin-top:3px;flex:none}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);padding:14px 16px}
 .card h3{font-size:15px;margin-bottom:8px}
 .muted{color:var(--ink3)}

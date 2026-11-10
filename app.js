@@ -40,8 +40,10 @@ function wcount(a, b) { let c = 0; for (let n = a; n <= b; n++) if (isWork(n)) c
 
 /* ---------- model ---------- */
 let P, I, undoStack = [], redoStack = [];
-const UI = { tab: 'summary', sel: null, level: 3, zoom: 'Month', colorBy: 'stage', links: true, labels: true, crit: false, base: false, wbsLevel: 3, msFilter: 'open', wlBy: 'both', wlUnit: 'month', boardShow: {}, welcome: true };
-const F = { q: '', stage: '', owner: '', res: '', status: '', cat: '' };
+const UI = { tab: 'summary', sel: null, level: 3, zoom: 'Month', colorBy: 'stage', links: true, labels: 'role', crit: false, base: false, wbsLevel: 3, msFilter: 'open', wlBy: 'both', wlUnit: 'month', boardShow: {}, welcome: true };
+const F = { q: '', stage: [], owner: [], res: [], status: [], cat: [] }; // each list filter keeps tasks matching any of its picks
+const MULTI = ['stage', 'owner', 'res', 'status', 'cat'];
+const clearF = () => { F.q = ''; MULTI.forEach(k => { F[k] = []; }); };
 const collapsed = new Set();
 const scrollMem = {};
 
@@ -367,7 +369,7 @@ function swapTasks(a, b) { // siblings trade places and WBS codes; links follow 
   const skip = new Set([...bf, ...bs]);
   P.tasks = P.tasks.flatMap(x => (x === first ? bs : x === second ? bf : skip.has(x) ? [] : [x]));
   P.risks.forEach(r => { if (codes.has(r.wbs)) r.wbs = codes.get(r.wbs); });
-  if (codes.has(F.stage)) F.stage = codes.get(F.stage);
+  F.stage = F.stage.map(c => codes.get(c) || c);
   index();
 }
 function moveTask(t, dir) {
@@ -410,7 +412,7 @@ function renameResource(r, raw) {
   commit(`Renamed resource “${from}” to “${to}”`, () => {
     P.tasks.forEach(t => RES_FIELDS.forEach(f => { if (t[f] === from) t[f] = to; }));
     if (other) P.resources = P.resources.filter(x => x !== r); else r.name = to;
-    if (F.res === from) F.res = to;
+    F.res = uniq(F.res.map(x => (x === from ? to : x)));
   });
   if (other) toast(`Merged “${from}” into “${to}”`);
 }
@@ -426,13 +428,13 @@ function viewResources() {
 }
 
 /* ---------- filtering ---------- */
-const filterActive = () => !!(F.q || F.stage || F.owner || F.res || F.status || F.cat);
+const filterActive = () => !!(F.q || MULTI.some(k => F[k].length));
 function match(t) {
-  if (F.stage && stageOf(t).wbs !== F.stage) return false;
-  if (F.owner && t.owner !== F.owner) return false;
-  if (F.res && !RES_FIELDS.some(f => t[f] === F.res)) return false;
-  if (F.status && t.status !== F.status) return false;
-  if (F.cat && t.category !== F.cat) return false;
+  if (F.stage.length && !F.stage.includes(stageOf(t).wbs)) return false;
+  if (F.owner.length && !F.owner.includes(t.owner)) return false;
+  if (F.res.length && !RES_FIELDS.some(f => F.res.includes(t[f]))) return false;
+  if (F.status.length && !F.status.includes(t.status)) return false;
+  if (F.cat.length && !F.cat.includes(t.category)) return false;
   if (F.q) { const q = F.q.toLowerCase(); if (!(`${t.wbs} ${t.name} ${t.scope} ${t.role} ${t.owner} ${t.other}`.toLowerCase().includes(q))) return false; }
   return true;
 }
@@ -449,14 +451,20 @@ function visibleRows() {
 function setLevel(n) { UI.level = n; collapsed.clear(); P.tasks.forEach(t => { if (isSum(t) && t.depth >= n) collapsed.add(t.id); }); }
 function uniq(arr) { return [...new Set(arr.filter(Boolean))].sort(); }
 function opt(v, sel, label) { return `<option value="${esc(v)}"${v === sel ? ' selected' : ''}>${esc(label == null ? v : label)}</option>`; }
+function msel(k, label, all, unit, items) { // tick any number of values; a list with nothing ticked shows everything
+  const pick = F[k], one = pick.length === 1 && items.find(([v]) => v === pick[0]);
+  const text = !pick.length ? all : one ? one[1] : `${pick.length} ${unit}`;
+  return `<details class="menu msel" data-msel="${k}"><summary class="msel-btn ${pick.length ? 'on' : ''}" aria-label="${esc(label)}" title="${esc(pick.length > 1 ? items.filter(([v]) => pick.includes(v)).map(([, l]) => l).join(', ') : label)}">${esc(text)}</summary>
+  <div class="menu-pop msel-pop">${pick.length ? `<button data-act="mselClear" data-k="${k}">✕ Show all</button><hr>` : ''}${items.map(([v, l]) => `<label><input type="checkbox" data-msel-v="${k}" value="${esc(v)}" ${pick.includes(v) ? 'checked' : ''}>${esc(l)}</label>`).join('')}</div></details>`;
+}
 function filterBar(extra = '', withLevel = true) {
-  const stages = P.tasks.filter(t => !parentOf(t));
+  const stages = P.tasks.filter(t => !parentOf(t)), same = v => [v, v];
   return `<input type="search" placeholder="🔍 Search tasks…" value="${esc(F.q)}" data-filter="q" aria-label="Search tasks">
-  <select data-filter="stage" aria-label="Stage">${opt('', F.stage, 'All stages')}${stages.map(s => opt(s.wbs, F.stage, `${s.wbs}. ${s.name}`)).join('')}</select>
-  <select data-filter="owner" aria-label="Task owner">${opt('', F.owner, 'All owners')}${uniq(P.tasks.map(t => t.owner)).map(o => opt(o, F.owner)).join('')}</select>
-  <select data-filter="res" aria-label="Role or resource">${opt('', F.res, 'All resources')}${[...P.resources].map(r => r.name).sort((a, b) => a.localeCompare(b)).map(o => opt(o, F.res)).join('')}</select>
-  <select data-filter="status" aria-label="Status">${opt('', F.status, 'All statuses')}${STATUSES.map(o => opt(o, F.status)).join('')}</select>
-  <select data-filter="cat" aria-label="Category">${opt('', F.cat, 'All categories')}${uniq(P.tasks.map(t => t.category)).map(o => opt(o, F.cat)).join('')}</select>
+  ${msel('stage', 'Stage', 'All stages', 'stages', stages.map(s => [s.wbs, `${s.wbs}. ${s.name}`]))}
+  ${msel('owner', 'Task owner', 'All owners', 'owners', uniq(P.tasks.map(t => t.owner)).map(same))}
+  ${msel('res', 'Role or resource', 'All resources', 'resources', [...P.resources].map(r => r.name).sort((a, b) => a.localeCompare(b)).map(same))}
+  ${msel('status', 'Status', 'All statuses', 'statuses', STATUSES.map(same))}
+  ${msel('cat', 'Category', 'All categories', 'categories', uniq(P.tasks.map(t => t.category)).map(same))}
   ${filterActive() ? '<button class="btn sm" data-act="clearFilters">✕ Clear</button>' : ''}
   ${withLevel ? `<label>Show levels <select data-act-change="level">${[1, 2, 3, 4, 5, 6].map(n => opt(String(n), String(UI.level), 'L' + n + (n === 6 ? ' (all)' : ''))).join('')}</select></label>` : ''}${extra}`;
 }
@@ -611,7 +619,7 @@ function viewGantt() {
     <button class="btn sm" data-act="scrollToday">📍 Today</button>
     <label>Colour <select data-act-change="colorBy">${[['stage', 'Stage'], ['status', 'Status'], ['owner', 'Owner']].map(([v, l]) => opt(v, UI.colorBy, l)).join('')}</select></label>
     <button class="btn sm ${UI.links ? 'on' : ''}" data-act="flag" data-k="links">🔗 Links</button>
-    <button class="btn sm ${UI.labels ? 'on' : ''}" data-act="flag" data-k="labels" data-tip="Shows each task's assigned role. Tasks with no role show their owner in italics.">🏷 Role labels</button>
+    <label data-tip="Text shown next to each bar. With Assigned role, tasks with no role show their owner in italics.">🏷 Labels <select data-act-change="labels">${[['', 'None'], ['role', 'Assigned role'], ['owner', 'Task owner'], ['status', 'Status']].map(([v, l]) => opt(v, UI.labels, l)).join('')}</select></label>
     <button class="btn sm ${UI.base ? 'on' : ''}" data-act="flag" data-k="base" data-tip="Grey line under each bar = saved baseline">📐 Baseline</button>
     <button class="btn sm ${UI.crit ? 'on' : ''}" data-act="flag" data-k="crit" data-tip="Chain of tasks driving the finish of the selected task (or stage 7 if none is selected)">🔥 Critical path</button>
     <span class="grow"></span>
@@ -706,8 +714,8 @@ function renderGantt() {
     let right = b;
     if (t.ms) { const mx = x(d2n(t.end)) + ppd / 2 + (milestoneOnly ? 0 : ppd / 2); s += `<path class="dia" data-h="${sum ? 'none' : 'move'}" d="M${mx} ${cy - 8}L${mx + 8} ${cy}L${mx} ${cy + 8}L${mx - 8} ${cy}Z" fill="${t.status === 'Done' ? 'var(--st-dn)' : inCrit ? 'var(--crit)' : 'var(--s4)'}"/>`; right = Math.max(b, mx + 8); }
     s += `<rect x="${right}" y="${cy - 8}" width="16" height="16" fill="transparent" data-h="none"/><circle class="lnk" data-h="link" cx="${right + 9}" cy="${cy}" r="5"/>`;
-    const lab = t.role || t.owner;
-    if (UI.labels && lab) s += `<text class="lbl ${t.role ? '' : 'alt'}" x="${right + 18}" y="${cy + 4}">${esc(lab.length > 46 ? lab.slice(0, 45) + '…' : lab)}</text>`;
+    const lab = UI.labels === 'owner' ? t.owner : UI.labels === 'status' ? t.status : t.role || t.owner;
+    if (UI.labels && lab) s += `<text class="lbl ${UI.labels === 'role' && !t.role ? 'alt' : ''}"x="${right + 18}" y="${cy + 4}">${esc(lab.length > 46 ? lab.slice(0, 45) + '…' : lab)}</text>`;
     return s + '</g>';
   }).join('');
   const rowLines = rows.map((t, i) => (t.id === UI.sel ? `<rect class="selb" x="0" y="${i * rh}" width="${W}" height="${rh}"/>` : '') + `<line class="rl" x1="0" x2="${W}" y1="${(i + 1) * rh - .5}" y2="${(i + 1) * rh - .5}"/>`).join('');
@@ -1358,11 +1366,12 @@ const ACTIONS = {
   },
   goto: el => { UI.tab = el.dataset.tab; renderTabs(); renderView(); saveUI(); $('#view').scrollTop = 0; window.scrollTo(0, 0); },
   dismissWelcome: () => { UI.welcome = false; saveUI(); renderView(); },
-  clearFilters: () => { Object.keys(F).forEach(k => { F[k] = ''; }); renderView(); },
+  clearFilters: () => { clearF(); renderView(); },
+  mselClear: el => { F[el.dataset.k] = []; renderFiltered(); },
   toggle: el => { const id = el.dataset.id; collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id); renderView(); },
   expandAll: () => { collapsed.clear(); UI.level = 6; renderView(); },
   collapseAll: () => { setLevel(1); renderView(); },
-  focusStage: el => { F.stage = el.dataset.wbs; UI.tab = 'gantt'; renderTabs(); rememberScroll(); delete scrollMem.gantt; renderGanttFresh(); },
+  focusStage: el => { F.stage = [el.dataset.wbs]; UI.tab = 'gantt'; renderTabs(); rememberScroll(); delete scrollMem.gantt; renderGanttFresh(); },
   zoom: el => { UI.zoom = el.dataset.z; renderGanttFresh(); saveUI(); },
   scrollToday: scrollGanttToToday,
   flag: el => { UI[el.dataset.k] = !UI[el.dataset.k]; renderView(); saveUI(); },
@@ -1370,14 +1379,14 @@ const ACTIONS = {
   moveUp: el => moveTask(I.byId.get(el.dataset.id), -1),
   moveDown: el => moveTask(I.byId.get(el.dataset.id), 1),
   addResource: () => dlgResource(),
-  resTasks: el => { const r = P.resources.find(x => x.id === el.dataset.id); Object.keys(F).forEach(k => { F[k] = ''; }); F.res = r.name; UI.tab = 'wbs'; renderTabs(); renderView(); saveUI(); },
+  resTasks: el => { const r = P.resources.find(x => x.id === el.dataset.id); clearF(); F.res = [r.name]; UI.tab = 'wbs'; renderTabs(); renderView(); saveUI(); },
   delResource: el => {
     const r = P.resources.find(x => x.id === el.dataset.id), n = P.tasks.filter(t => RES_FIELDS.some(f => t[f] === r.name)).length;
     dialog('Delete this resource?', `<p><b>${esc(r.name)}</b> will be removed from the list${n ? ` and cleared from ${n} task${n > 1 ? 's' : ''}` : ''}. You can undo this.</p>`, () => {
       commit(`Deleted resource “${r.name}”`, () => {
         P.tasks.forEach(t => RES_FIELDS.forEach(f => { if (t[f] === r.name) t[f] = ''; }));
         P.resources = P.resources.filter(x => x !== r);
-        if (F.res === r.name) F.res = '';
+        F.res = F.res.filter(x => x !== r.name);
       });
     }, 'Delete');
   },
@@ -1454,9 +1463,15 @@ document.addEventListener('input', e => {
   const k = e.target.dataset && e.target.dataset.filter;
   if (k === 'q') { F.q = e.target.value; clearTimeout(ACTIONS._q); ACTIONS._q = setTimeout(() => { const pos = e.target.selectionStart; renderView(); const s = $('[data-filter=q]'); if (s) { s.focus(); s.setSelectionRange(pos, pos); } }, 220); }
 });
+function renderFiltered(openKey) { // keeps the list the user is ticking open, at the same scroll position
+  const was = openKey && $(`details[data-msel="${openKey}"] .msel-pop`), top = was ? was.scrollTop : 0;
+  if (UI.tab === 'gantt') renderGanttFresh(); else renderView();
+  const d = openKey && $(`details[data-msel="${openKey}"]`);
+  if (d) { d.open = true; d.querySelector('.msel-pop').scrollTop = top; }
+}
 document.addEventListener('change', async e => {
   const el = e.target, ds = el.dataset || {};
-  if (ds.filter && ds.filter !== 'q') { F[ds.filter] = el.value; if (UI.tab === 'gantt') renderGanttFresh(); else renderView(); return; }
+  if (ds.mselV) { const k = ds.mselV; F[k] = el.checked ? [...F[k], el.value] : F[k].filter(v => v !== el.value); renderFiltered(k); return; }
   if (ds.actChange === 'level') { setLevel(+el.value); renderView(); return; }
   if (ds.actChange) { UI[ds.actChange] = el.value; renderView(); saveUI(); return; }
   if (ds.f) {
@@ -1538,7 +1553,7 @@ document.addEventListener('dragend', () => $$('.col.over').forEach(x => x.classL
 window.addEventListener('resize', () => { if (UI.tab === 'gantt' && UI.zoom === 'Fit') renderGantt(); });
 
 /* ---------- boot ---------- */
-try { const u = JSON.parse(localStorage.getItem(UI_KEY) || '{}'); ['tab', 'zoom', 'colorBy', 'links', 'labels', 'base', 'welcome'].forEach(k => { if (u[k] !== undefined) UI[k] = u[k]; }); if (u.theme) document.documentElement.dataset.theme = u.theme; if (!VIEWS[UI.tab]) UI.tab = 'summary'; } catch (e) { /* defaults */ }
+try { const u = JSON.parse(localStorage.getItem(UI_KEY) || '{}'); ['tab', 'zoom', 'colorBy', 'links', 'labels', 'base', 'welcome'].forEach(k => { if (u[k] !== undefined) UI[k] = u[k]; }); if (typeof UI.labels === 'boolean') UI.labels = UI.labels ? 'role' : ''; if (u.theme) document.documentElement.dataset.theme = u.theme; if (!VIEWS[UI.tab]) UI.tab = 'summary'; } catch (e) { /* defaults */ }
 const hadLocal = load();
 setLevel(UI.level);
 renderAll();

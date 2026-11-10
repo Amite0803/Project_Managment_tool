@@ -10,7 +10,7 @@ Seed data: `NSDI_Geoportal_Task_Breakdown_V11_01112026.xlsx`.
 |---|---|
 | Executive Summary | Headline, KPIs, stage timeline, main tasks by stage, categories, owners, coming up, needs attention |
 | WBS | Collapsible task tree with click-to-edit cells, filters and search; reorder with ▲▼; add sub-tasks and milestones |
-| Gantt | Drag to move or resize, drag to link, FS/SS/FF/SF dependencies with lag, milestones, baseline, critical path, zoom; reorder with ▲▼; bars labelled with the assigned role |
+| Gantt | Drag to move or resize, drag to link, FS/SS/FF/SF dependencies with lag, milestones, baseline, critical path, zoom; reorder with ▲▼; bar labels show the assigned role, task owner or status |
 | Milestones | Milestone list with countdown, baseline variance and add/complete actions |
 | Board | Kanban by status with drag and drop |
 | Resources | Teams, roles and people that fill the owner, role and participant dropdowns; add, rename, merge or delete |
@@ -62,7 +62,8 @@ Editors stay signed in on that browser. To remove someone, the owner clicks *Rem
 - The workbook has no progress column, so starting progress is estimated from status: Not started 0%, Ongoing 50%, Review and QA 90%, Done 100%.
 - Milestones are seeded from zero-duration tasks and from names containing sign-off, final approval, kickoff or acceptance certificate.
 - Moving a task up or down swaps it with the neighbouring task under the same parent. The two trade WBS codes, including their sub-tasks; links and dates do not change. So codes can differ from the workbook after a move.
-- Gantt labels show the assigned role. Tasks with no role show the task owner in italics.
+- Gantt *Labels* shows the assigned role, task owner or status next to each bar, or nothing. With assigned role, tasks with no role show the task owner in italics.
+- Each filter (stage, owner, resource, status, category) can hold several values. A task shows if it matches any value ticked in a filter, across every filter that has values ticked.
 - Critical path shows the chain of dependencies driving the finish of the selected task. It is not a full float calculation.
 
 ## Files
